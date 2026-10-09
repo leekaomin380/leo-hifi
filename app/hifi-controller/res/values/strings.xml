@@ -1,0 +1,23 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="leo_hifi_no_readback">No verified HAL volume readback</string>
+    <string name="leo_monitor_channel">Status monitor</string>
+    <string name="leo_active_channel">Verified HiFi activity</string>
+    <string name="leo_monitor_title">Leo status monitor</string>
+    <string name="leo_monitor_description">Monitoring only. This notification does not mean HiFi is active.</string>
+    <string name="leo_active_description">Fresh route and playback evidence · expires when not refreshed</string>
+    <string name="leo_hifi_label">HIFI</string>
+    <string name="leo_hifi_unavailable">Backend unavailable</string>
+    <string name="leo_hifi_waiting">Waiting for confirmation</string>
+    <string name="leo_hifi_active">ESS active · %1$s</string>
+    <string name="leo_hifi_error">Request or route error</string>
+    <string name="leo_hifi_volume_title">HiFi control</string>
+    <string name="leo_hifi_standby">Enabled · standby</string>
+    <string name="leo_hifi_off">Off</string>
+    <string name="leo_hifi_volume_warning">While HiFi is active the volume keys drive the DAC (2 dB per step, capped at -9 dB) and Android gain stays at 0 dB. Enable "HiFi DAC volume keys" under Accessibility. Leaving HiFi restores the previous Android volume first.</string>
+    <string name="leo_hifi_volume_readback">DAC readback: %1$d / %2$d (baseline not restored)</string>
+<string name="leo_hifi_volume_fixed">DAC readback: %1$d / %2$d · baseline confirmed</string><string name="leo_hifi_enable">Enable HiFi</string><string name="leo_hifi_disable">Disable HiFi</string>    <string name="leo_dac_level">DAC %1$d dB</string>
+    <string name="leo_key_service_label">HiFi DAC volume keys</string>
+    <string name="leo_key_service_description">Only while HiFi is verified active, the volume keys drive the ESS DAC; otherwise Android handles them.</string>
+    <string name="leo_hifi_dac_readback">DAC %1$d dB (readback %2$d / %3$d)</string>
+</resources>

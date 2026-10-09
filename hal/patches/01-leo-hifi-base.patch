@@ -1,0 +1,1791 @@
+diff --git a/hal/Android.mk b/hal/Android.mk
+index 7eca4aa..923d079 100644
+--- a/hal/Android.mk
++++ b/hal/Android.mk
+@@ -49,6 +49,20 @@ LOCAL_SRC_FILES += audio_extn/audio_extn.c \
+ 
+ LOCAL_CFLAGS += -DUSE_VENDOR_EXTN
+ 
++# Leo (Xiaomi Mi Note Pro) HiFi controller: ES9018K2M over QUAT_MI2S.
++#
++# Opt-in per device: set AUDIO_FEATURE_ENABLED_LEO_HIFI := true in the device
++# BoardConfig.  Every other target -- including the other msm8974-platform
++# boards that share this source file -- builds byte-identical to upstream.
++# The inner guard keeps the build honest if the flag is ever set on a board
++# whose AUDIO_PLATFORM is not msm8974.
++ifeq ($(strip $(AUDIO_FEATURE_ENABLED_LEO_HIFI)),true)
++ifeq ($(strip $(AUDIO_PLATFORM)),msm8974)
++    LOCAL_SRC_FILES += $(AUDIO_PLATFORM)/leo_hifi.c
++    LOCAL_CFLAGS += -DLEO_HIFI_ENABLED
++endif
++endif
++
+ ifneq ($(filter msm8994 msm8992,$(TARGET_BOARD_PLATFORM)),)
+     LOCAL_SRC_FILES += edid.c
+ endif
+diff --git a/hal/audio_hw.c b/hal/audio_hw.c
+index 62ae845..9d27258 100644
+--- a/hal/audio_hw.c
++++ b/hal/audio_hw.c
+@@ -66,6 +66,9 @@
+ #include <audio_effects/effect_ns.h>
+ #include "audio_hw.h"
+ #include "platform_api.h"
++#ifdef LEO_HIFI_ENABLED
++#include "leo_hifi.h"
++#endif
+ #include <platform.h>
+ #include "audio_extn.h"
+ #include "voice_extn.h"
+@@ -553,6 +556,16 @@ int enable_audio_route(struct audio_device *adev,
+     platform_add_backend_name(mixer_path, snd_device);
+     ALOGD("%s: apply mixer and update path: %s", __func__, mixer_path);
+     audio_route_apply_and_update_path(adev->audio_route, mixer_path);
++#ifdef LEO_HIFI_ENABLED
++    /*
++     * Leo: the route has been applied; now prove it.  "Headphones make sound"
++     * is not evidence -- M2 showed on the real device that AudioFlinger will
++     * open SLIMBUS_0_RX <- MultiMedia5 behind our back.  Anything short of the
++     * full read-back set falls back so that what the user hears matches what
++     * the UI says.
++     */
++    platform_leo_hifi_route_enabled(adev->platform, (int)snd_device);
++#endif
+     ALOGV("%s: exit", __func__);
+     return 0;
+ }
+@@ -575,6 +588,16 @@ int disable_audio_route(struct audio_device *adev,
+     platform_add_backend_name(mixer_path, snd_device);
+     ALOGD("%s: reset and update mixer path: %s", __func__, mixer_path);
+     audio_route_reset_and_update_path(adev->audio_route, mixer_path);
++#ifdef LEO_HIFI_ENABLED
++    /*
++     * Leo: restore the QUAT backend deterministically after the route is torn
++     * down.  Upstream never resets these controls, so without this a non-48
++     * kHz session would leave the backend at the wrong rate for the next
++     * deep-buffer stream.
++     */
++    platform_leo_hifi_backend_exit(adev->platform, (int)snd_device);
++    platform_leo_hifi_route_disabled(adev->platform, (int)snd_device);
++#endif
+     audio_extn_sound_trigger_update_stream_status(usecase, ST_EVENT_STREAM_FREE);
+     audio_extn_listen_update_stream_status(usecase, LISTEN_EVENT_STREAM_FREE);
+     ALOGV("%s: exit", __func__);
+@@ -606,6 +629,14 @@ int enable_snd_device(struct audio_device *adev,
+         return 0;
+     }
+ 
++#ifdef LEO_HIFI_ENABLED
++    /*
++     * Leo: pin the QUAT backend before the mixer path starts the DAI.  This is
++     * the first point in select_devices() that sees the NEW device.
++     */
++    platform_leo_hifi_snd_device_enabled(adev->platform, (int)snd_device);
++#endif
++
+     if (audio_extn_spkr_prot_is_enabled())
+          audio_extn_spkr_prot_calib_cancel(adev);
+     /* start usb playback thread */
+@@ -2337,6 +2368,9 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
+     struct audio_device *adev = out->dev;
+     int snd_scard_state = get_snd_card_state(adev);
+     ssize_t ret = 0;
++#ifdef LEO_HIFI_ENABLED
++    unsigned long long leo_token = 0;
++#endif
+ 
+     lock_output_stream(out);
+ 
+@@ -2428,6 +2462,11 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
+             if (adev->adm_request_focus)
+                 adev->adm_request_focus(adev->adm_data, out->handle);
+ 
++#ifdef LEO_HIFI_ENABLED
++            /* Capture before the blocking write. A route change invalidates this token. */
++            if (out->usecase == USECASE_AUDIO_PLAYBACK_DEEP_BUFFER)
++                leo_token = platform_leo_hifi_flow_token(adev->platform);
++#endif
+             if (out->usecase == USECASE_AUDIO_PLAYBACK_AFE_PROXY)
+                 ret = pcm_mmap_write(out->pcm, (void *)buffer, bytes);
+             else
+@@ -2435,8 +2474,19 @@ static ssize_t out_write(struct audio_stream_out *stream, const void *buffer,
+ 
+             if (ret < 0)
+                 ret = -errno;
+-            else if (ret == 0)
++            else if (ret == 0) {
+                 out->written += bytes / (out->config.channels * sizeof(short));
++#ifdef LEO_HIFI_ENABLED
++                if (out->format == AUDIO_FORMAT_PCM_16_BIT &&
++                    out->usecase == USECASE_AUDIO_PLAYBACK_DEEP_BUFFER) {
++                    unsigned int avail = 0;
++                    struct timespec timestamp;
++                    bool valid = pcm_get_htimestamp(out->pcm, &avail, &timestamp) == 0;
++                    platform_leo_hifi_note_frames(adev->platform, leo_token,
++                        (uintptr_t)out, out->written, pcm_get_buffer_size(out->pcm), avail, valid);
++                }
++#endif
++            }
+ 
+             if (adev->adm_abandon_focus)
+                 adev->adm_abandon_focus(adev->adm_data, out->handle);
+diff --git a/hal/msm8974/leo_hifi.c b/hal/msm8974/leo_hifi.c
+new file mode 100644
+index 0000000..57606ee
+--- /dev/null
++++ b/hal/msm8974/leo_hifi.c
+@@ -0,0 +1,877 @@
++/*
++ * Copyright (C) 2026 The Leo Audio OS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++#define LOG_TAG "leo_hifi"
++/*#define LOG_NDEBUG 0*/
++
++#include <errno.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/stat.h>
++
++#include <log/log.h>
++#include <cutils/properties.h>
++
++#include "leo_hifi.h"
++
++/*
++ * sysfs proof that the ES9018 codec driver bound to I2C 6-0048.
++ * Overridable so that the host-side fault-injection harness can point it at a
++ * temporary path; the device build never defines it.
++ */
++#ifndef LEO_ESS_SYSFS_DRIVER
++#define LEO_ESS_SYSFS_DRIVER "/sys/bus/i2c/devices/6-0048/driver"
++#endif
++
++/*
++ * Resolve one control.  A missing control is a probe failure, but a
++ * *retryable* one: the codec component may simply not have bound yet.
++ */
++static struct mixer_ctl *leo_ctl(struct leo_hifi *lh, const char *name)
++{
++    struct mixer_ctl *ctl = mixer_get_ctl_by_name(lh->mixer, name);
++
++    if (ctl == NULL) {
++        ALOGW("%s: mixer control '%s' not found", __func__, name);
++        lh->supported = false;
++        lh->fail_code = LEO_FAIL_CTL_MISSING;
++    }
++    return ctl;
++}
++
++/* Optional control: absence is recorded, not a failure. */
++static struct mixer_ctl *leo_ctl_opt(struct leo_hifi *lh, const char *name)
++{
++    struct mixer_ctl *ctl = mixer_get_ctl_by_name(lh->mixer, name);
++
++    if (ctl == NULL)
++        ALOGV("%s: optional mixer control '%s' absent", __func__, name);
++    return ctl;
++}
++
++static bool leo_ess_bound(void)
++{
++    struct stat st;
++
++    /* stat() follows the symlink; ENOENT means the driver never bound. */
++    return (stat(LEO_ESS_SYSFS_DRIVER, &st) == 0);
++}
++
++/*
++ * Read-only probe.  Writes nothing, so it is safe to call again later.
++ * Returns lh->supported.
++ */
++static bool leo_probe(struct leo_hifi *lh)
++{
++    char ctl_name[64];
++    int i;
++
++    lh->probe_attempts++;
++    lh->supported = true;
++    lh->fail_code = LEO_FAIL_NONE;
++
++    if (lh->mixer == NULL) {
++        ALOGE("%s: no mixer handle", __func__);
++        lh->supported = false;
++        lh->permanent_fail = true;
++        lh->fail_code = LEO_FAIL_CTL_MISSING;
++        return false;
++    }
++
++    /*
++     * Structural self-check.  If the device table no longer maps our symbol to
++     * the mixer_paths.xml path name we do not know which device we would be
++     * enabling, so HiFi is disabled permanently rather than degraded.  This is
++     * the one failure class that is never retried: it cannot fix itself.
++     */
++    if (lh->device_name == NULL ||
++        strcmp(lh->device_name, LEO_HIFI_DEVICE_NAME) != 0) {
++        ALOGE("%s: device_table mismatch ('%s' != '%s'); HiFi disabled for good",
++              __func__, lh->device_name ? lh->device_name : "(null)",
++              LEO_HIFI_DEVICE_NAME);
++        lh->supported = false;
++        lh->permanent_fail = true;
++        lh->fail_code = LEO_FAIL_TABLE_MISMATCH;
++        return false;
++    }
++
++    if (!leo_ess_bound()) {
++        ALOGW("%s: %s absent; ES9018 not bound (attempt %d/%d)", __func__,
++              LEO_ESS_SYSFS_DRIVER, lh->probe_attempts, LEO_HIFI_PROBE_MAX);
++        lh->supported = false;
++        lh->fail_code = LEO_FAIL_ESS_UNBOUND;
++        return false;
++    }
++
++    /*
++     * Resolve every control up-front so that "control missing" is discovered
++     * before a route change rather than half-way through one.
++     */
++    lh->ctl_volume        = leo_ctl(lh, "Volume");
++    lh->ctl_quat_bw       = leo_ctl(lh, "QUAT_MI2S BitWidth");
++    lh->ctl_quat_sr       = leo_ctl(lh, "QUAT_MI2S SampleRate");
++    lh->ctl_hphl_dac      = leo_ctl(lh, "HPHL DAC Switch");
++    lh->ctl_slim_rx1_mux  = leo_ctl(lh, "SLIM RX1 MUX");
++    lh->ctl_slim_rx2_mux  = leo_ctl(lh, "SLIM RX2 MUX");
++
++    /*
++     * The sound card exposes a single "HPHL DAC Switch"; the right channel is
++     * gated through the RX2 chain and CLASS_H_DSM MUX instead.  These are
++     * optional so that a card revision without them still works, but when
++     * present they widen the bypass observation to both channels.
++     */
++    lh->ctl_rx1_mix1_inp1 = leo_ctl_opt(lh, "RX1 MIX1 INP1");
++    lh->ctl_rx2_mix1_inp1 = leo_ctl_opt(lh, "RX2 MIX1 INP1");
++    lh->ctl_class_h_mux   = leo_ctl_opt(lh, "CLASS_H_DSM MUX");
++
++    for (i = 0; i < LEO_HIFI_MM_COUNT; i++) {
++        snprintf(ctl_name, sizeof(ctl_name),
++                 "SLIMBUS_0_RX Audio Mixer MultiMedia%d", i + 1);
++        lh->ctl_slim_mm[i] = leo_ctl(lh, ctl_name);
++
++        /*
++         * QUAT_MI2S_RX has no MultiMedia9 mixer on this card, so these are
++         * optional: absence of one index must not disable the controller.
++         */
++        snprintf(ctl_name, sizeof(ctl_name),
++                 "QUAT_MI2S_RX Audio Mixer MultiMedia%d", i + 1);
++        lh->ctl_quat_mm[i] = leo_ctl_opt(lh, ctl_name);
++    }
++
++    if (!lh->supported)
++        ALOGW("%s: probe %d/%d failed, fail_code=%d", __func__,
++              lh->probe_attempts, LEO_HIFI_PROBE_MAX, lh->fail_code);
++    else
++        ALOGI("%s: probe %d succeeded", __func__, lh->probe_attempts);
++
++    return lh->supported;
++}
++
++void leo_hifi_init(struct leo_hifi *lh, struct mixer *mixer,
++                   const char *device_table_name)
++{
++    char value[PROPERTY_VALUE_MAX];
++    struct timespec now;
++
++    memset(lh, 0, sizeof(*lh));
++    pthread_mutex_init(&lh->telemetry_lock, NULL);
++    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
++        lh->session = ((unsigned long long)now.tv_sec * 1000000000ULL
++                       + (unsigned long long)now.tv_nsec) & 0x7fffffffffffffffULL;
++    leo_flow_reset(&lh->flow);
++
++    lh->effective = LEO_HIFI_IDLE;
++    lh->mixer = mixer;
++    lh->device_name = device_table_name;
++
++    (void) leo_probe(lh);
++
++    /* Policy intent.  Default OFF: an untouched device behaves like stock. */
++    if (property_get(LEO_PROP_ENABLE, value, "false") > 0)
++        lh->requested = (strcmp(value, "true") == 0);
++    else
++        lh->requested = false;
++
++    /*
++     * Volume intent is READ but deliberately NOT APPLIED here.
++     *
++     * Until runtime experiments R6 (does the Android software volume stack
++     * with this control?) and R7 (is the direction and magnitude what the
++     * kernel TLV says?) are done, the shipping default must leave the control
++     * at the mixer_paths.xml value of 205.  None of 213/225/229 may become a
++     * product default before then.  See docs/19 section 6.2.
++     */
++    if (property_get(LEO_PROP_VOLUME, value, "") > 0 && value[0] != '\0') {
++        int v = atoi(value);
++
++        if (v < 0)
++            v = 0;
++        if (v > LEO_HIFI_VOL_MAX)
++            v = LEO_HIFI_VOL_MAX;
++        lh->vol_user = v;
++    }
++    lh->vol_applied = false;
++
++    /* A service restart does not itself prove that mixer state was reset.
++     * Never replay saved gain. Recover only after the device/control probe. */
++    if (lh->supported && leo_hifi_restore_volume_floor(lh) != 0)
++        lh->effective = LEO_HIFI_ERROR_FALLBACK;
++
++    /*
++     * property_set() may fail before the vendor property_contexts entry
++     * exists (it is a device-tree change, docs/19 section 9.4).  That is not
++     * fatal: the published property is a convenience, not a control path.
++     */
++    (void) property_set(LEO_PROP_SUPPORTED, lh->supported ? "true" : "false");
++
++    ALOGI("%s: supported=%d permanent_fail=%d requested=%d vol_user=%d fail=%d",
++          __func__, lh->supported, lh->permanent_fail, lh->requested,
++          lh->vol_user, lh->fail_code);
++}
++
++bool leo_hifi_route_wanted(struct leo_hifi *lh)
++{
++    if (!lh->requested)
++        return false;
++
++    if (lh->supported)
++        return !lh->vol_restore_pending || leo_hifi_restore_volume_floor(lh) == 0;
++
++    /*
++     * Bounded, read-only late re-probe.  See LEO_HIFI_PROBE_MAX.  A failed
++     * re-probe returns the same standard device as before, so select_devices()
++     * sees no device change and does not re-route: no pop, no loop.
++     */
++    if (lh->permanent_fail || lh->probe_attempts >= LEO_HIFI_PROBE_MAX)
++        return false;
++
++    ALOGI("%s: re-probing (attempt %d of %d)", __func__,
++          lh->probe_attempts + 1, LEO_HIFI_PROBE_MAX);
++    if (leo_probe(lh)) {
++        (void) property_set(LEO_PROP_SUPPORTED, "true");
++        return leo_hifi_restore_volume_floor(lh) == 0;
++    }
++    return false;
++}
++
++void leo_hifi_ctl_to_db(int ctl_value, const char **sign, int *whole, int *tenth)
++{
++    int dq = ctl_value * 5 - 1275;      /* exact tenths of a dB */
++
++    *sign = (dq < 0) ? "-" : "";
++    if (dq < 0)
++        dq = -dq;
++    *whole = dq / 10;
++    *tenth = dq % 10;
++}
++
++int leo_hifi_read_volume(struct leo_hifi *lh, int out[2])
++{
++    if (!lh->supported || lh->ctl_volume == NULL)
++        return -ENODEV;
++
++    out[0] = mixer_ctl_get_value(lh->ctl_volume, 0);
++    out[1] = mixer_ctl_get_value(lh->ctl_volume, 1);
++    if (out[0] < 0 || out[1] < 0)
++        return -EIO;
++
++    return 0;
++}
++
++static int leo_write_volume_ctl(struct leo_hifi *lh, int ctl_value)
++{
++    int values[2];
++    int back[2] = {-1, -1};
++    const char *sign;
++    int whole, tenth;
++    int ret;
++
++    /* Hard clamp: never below the factory floor, never above the stage cap. */
++    if (ctl_value < LEO_HIFI_CTL_FLOOR)
++        ctl_value = LEO_HIFI_CTL_FLOOR;
++    if (ctl_value > LEO_HIFI_CTL_CEIL)
++        ctl_value = LEO_HIFI_CTL_CEIL;
++
++    values[0] = values[1] = ctl_value;
++    ret = mixer_ctl_set_array(lh->ctl_volume, values, 2);
++    if (ret != 0) {
++        ALOGE("%s: write %d failed (%d)", __func__, ctl_value, ret);
++        lh->fail_code = LEO_FAIL_CTL_WRITE;
++        return -EIO;
++    }
++
++    if (leo_hifi_read_volume(lh, back) != 0 ||
++        back[0] != ctl_value || back[1] != ctl_value) {
++        ALOGE("%s: read-back mismatch: wrote %d, read %d/%d",
++              __func__, ctl_value, back[0], back[1]);
++        lh->fail_code = LEO_FAIL_READBACK_SOFT;
++        return -EIO;
++    }
++
++    leo_hifi_ctl_to_db(ctl_value, &sign, &whole, &tenth);
++    ALOGI("%s: ES9018 Volume = %d (%s%d.%d dB)", __func__, ctl_value,
++          sign, whole, tenth);
++    return 0;
++}
++
++int leo_hifi_restore_volume_floor(struct leo_hifi *lh)
++{
++    int back[2];
++    int ret;
++
++    lh->vol_restore_pending = true;
++    if (!lh->supported || lh->ctl_volume == NULL)
++        return -ENODEV;
++
++    if (leo_hifi_read_volume(lh, back) == 0 &&
++        back[0] == LEO_HIFI_CTL_FLOOR && back[1] == LEO_HIFI_CTL_FLOOR)
++        ret = 0;
++    else
++        ret = leo_write_volume_ctl(lh, LEO_HIFI_CTL_FLOOR);
++
++    if (ret == 0) {
++        lh->vol_applied = false;
++        lh->vol_restore_pending = false;
++    } else {
++        lh->effective = LEO_HIFI_ERROR_FALLBACK;
++    }
++    return ret;
++}
++
++int leo_hifi_apply_volume(struct leo_hifi *lh, int user_vol)
++{
++    char buf[PROPERTY_VALUE_MAX];
++    int target, current, step;
++    int back[2];
++
++    if (!lh->supported || lh->ctl_volume == NULL)
++        return -ENODEV;
++
++    if (lh->vol_restore_pending)
++        return -EIO;
++
++    if (user_vol < 0 || user_vol > LEO_HIFI_VOL_MAX) {
++        ALOGW("%s: request %d out of [0,%d]; keeping current value",
++              __func__, user_vol, LEO_HIFI_VOL_MAX);
++        lh->fail_code = LEO_FAIL_VOL_RANGE;
++        return -EINVAL;
++    }
++
++    if (leo_hifi_read_volume(lh, back) != 0 || back[0] != back[1] ||
++        back[0] < LEO_HIFI_CTL_FLOOR || back[0] > LEO_HIFI_CTL_CEIL) {
++        lh->fail_code = LEO_FAIL_READBACK_SOFT;
++        (void) leo_hifi_restore_volume_floor(lh);
++        return -EIO;
++    }
++    current = back[0];
++    target = leo_hifi_user_to_ctl(user_vol);
++
++    /* Ramp in bounded frames so a UI drag cannot produce a jump. */
++    step = (LEO_HIFI_VOL_STEP_MAX * 2) / 5;
++    if (step < 1)
++        step = 1;
++
++    while (current != target) {
++        int next;
++
++        if (target > current)
++            next = (target - current > step) ? current + step : target;
++        else
++            next = (current - target > step) ? current - step : target;
++
++        if (leo_write_volume_ctl(lh, next) != 0) {
++            /* A failed/partial write may already have changed hardware.
++             * Keep recovery pending until BOTH channels prove the floor. */
++            (void) leo_hifi_restore_volume_floor(lh);
++            return -EIO;
++        }
++        current = next;
++        if (current != target)
++            usleep(20000);
++    }
++
++    lh->vol_user = user_vol;
++    lh->vol_applied = true;
++    snprintf(buf, sizeof(buf), "%d", user_vol);
++    (void) property_set(LEO_PROP_VOLUME, buf);
++    return 0;
++}
++
++static int leo_set_enum_checked(struct leo_hifi *lh, struct mixer_ctl *ctl,
++                                const char *ctl_name, const char *want)
++{
++    const char *got;
++    int idx;
++    int ret;
++
++    if (ctl == NULL)
++        return -ENODEV;
++
++    ret = mixer_ctl_set_enum_by_string(ctl, want);
++    if (ret != 0) {
++        ALOGE("%s: '%s' <- '%s' failed (%d)", __func__, ctl_name, want, ret);
++        lh->fail_code = LEO_FAIL_CTL_WRITE;
++        return -EIO;
++    }
++
++    idx = mixer_ctl_get_value(ctl, 0);
++    got = (idx >= 0) ? mixer_ctl_get_enum_string(ctl, (unsigned int)idx) : NULL;
++    if (got == NULL || strcmp(got, want) != 0) {
++        ALOGE("%s: '%s' read-back '%s' != '%s'", __func__, ctl_name,
++              got ? got : "(null)", want);
++        lh->fail_code = LEO_FAIL_BACKEND_READBACK;
++        return -EIO;
++    }
++
++    ALOGI("%s: '%s' = '%s' (read back)", __func__, ctl_name, want);
++    return 0;
++}
++
++int leo_hifi_set_backend(struct leo_hifi *lh)
++{
++    int ret;
++
++    if (!lh->supported)
++        return -ENODEV;
++
++    ret = leo_set_enum_checked(lh, lh->ctl_quat_bw, "QUAT_MI2S BitWidth",
++                               LEO_HIFI_BITWIDTH_STR);
++    if (ret != 0)
++        return ret;
++
++    return leo_set_enum_checked(lh, lh->ctl_quat_sr, "QUAT_MI2S SampleRate",
++                                LEO_HIFI_SAMPLERATE_STR);
++}
++
++bool leo_hifi_set_mode(struct leo_hifi *lh, bool enable)
++{
++    bool old = lh->requested;
++
++    /*
++     * The intent is recorded even when the controller is currently
++     * unsupported: a later successful re-probe should honour what the user
++     * asked for.  Route selection still refuses until a probe succeeds.
++     */
++    lh->requested = enable;
++    if (!enable && (lh->vol_applied || lh->vol_restore_pending))
++        (void) leo_hifi_restore_volume_floor(lh);
++    (void) property_set(LEO_PROP_ENABLE, enable ? "true" : "false");
++    ALOGI("%s: leo_hifi_mode %s -> %s (supported=%d)", __func__,
++          old ? "true" : "false", enable ? "true" : "false", lh->supported);
++
++    return (old != enable);
++}
++
++static const char *leo_state_name(leo_hifi_state_t s)
++{
++    switch (s) {
++    case LEO_HIFI_IDLE:            return "idle";
++    case LEO_HIFI_SPEAKER:         return "speaker";
++    case LEO_HIFI_WIRED_STANDARD:  return "wired_standard";
++    case LEO_HIFI_ARMING:          return "arming";
++    case LEO_HIFI_ACTIVE:          return "hifi_active";
++    case LEO_HIFI_DEGRADED:        return "hifi_degraded";
++    case LEO_HIFI_ERROR_FALLBACK:  return "error_fallback";
++    default:                       return "unknown";
++    }
++}
++
++/* An enum control counts as "live" when it is resolvable and not ZERO. */
++static bool leo_enum_is_live(struct mixer_ctl *ctl)
++{
++    const char *s;
++    int idx;
++
++    if (ctl == NULL)
++        return false;
++
++    idx = mixer_ctl_get_value(ctl, 0);
++    if (idx < 0)
++        return false;
++
++    s = mixer_ctl_get_enum_string(ctl, (unsigned int)idx);
++    return (s != NULL && strcmp(s, "ZERO") != 0);
++}
++
++bool leo_hifi_check_bypass(struct leo_hifi *lh)
++{
++    unsigned int bp = 0;
++    int i;
++    int v;
++
++    /* (1) digital front end feeding the WCD backend */
++    for (i = 0; i < LEO_HIFI_MM_COUNT; i++) {
++        if (lh->ctl_slim_mm[i] == NULL)
++            continue;
++        v = mixer_ctl_get_value(lh->ctl_slim_mm[i], 0);
++        if (v > 0) {
++            ALOGD("%s: SLIMBUS_0_RX Audio Mixer MultiMedia%d is On",
++                  __func__, i + 1);
++            bp |= LEO_BP_SLIM_FE;
++        }
++    }
++
++    /* (2) SLIM receive muxes, both channels */
++    if (leo_enum_is_live(lh->ctl_slim_rx1_mux) ||
++        leo_enum_is_live(lh->ctl_slim_rx2_mux))
++        bp |= LEO_BP_MUX_LIVE;
++
++    /* (3) interpolator inputs, both channels (optional controls) */
++    if (leo_enum_is_live(lh->ctl_rx1_mix1_inp1) ||
++        leo_enum_is_live(lh->ctl_rx2_mix1_inp1))
++        bp |= LEO_BP_MIX_LIVE;
++
++    /* (4) Class-H DSM mux -- this is what gates the RIGHT channel DAC */
++    if (leo_enum_is_live(lh->ctl_class_h_mux))
++        bp |= LEO_BP_CLASSH;
++
++    /* (5) the analog outlet itself: the decisive gate */
++    if (lh->ctl_hphl_dac != NULL) {
++        v = mixer_ctl_get_value(lh->ctl_hphl_dac, 0);
++        if (v > 0)
++            bp |= LEO_BP_OUTLET;
++    }
++
++    lh->bypass = bp;
++
++    if (bp & LEO_BP_FATAL_MASK) {
++        ALOGE("%s: FATAL WCD bypass: the analog outlet is open "
++              "(bypass mask 0x%x)", __func__, bp);
++        lh->fail_code = LEO_FAIL_WCD_BYPASS;
++        return false;
++    }
++
++    if (bp != 0)
++        ALOGW("%s: bypass attempt observed but the analog outlet is cut "
++              "(mask 0x%x); not audible, recorded only", __func__, bp);
++
++    return true;
++}
++
++static bool leo_quat_front_end_live(struct leo_hifi *lh)
++{
++    int i;
++    int v;
++
++    for (i = 0; i < LEO_HIFI_MM_COUNT; i++) {
++        if (lh->ctl_quat_mm[i] == NULL)
++            continue;
++        v = mixer_ctl_get_value(lh->ctl_quat_mm[i], 0);
++        if (v > 0) {
++            ALOGI("%s: QUAT_MI2S_RX Audio Mixer MultiMedia%d is On",
++                  __func__, i + 1);
++            return true;
++        }
++    }
++
++    ALOGE("%s: no QUAT_MI2S_RX front end is routed; the mixer path did not "
++          "take effect", __func__);
++    return false;
++}
++
++static void leo_hifi_fallback(struct leo_hifi *lh)
++{
++    /*
++     * Unified fallback.  Stop writing, undo what this generation wrote in
++     * reverse order, and leave the controller in a state that requires a
++     * fresh generation (and a fresh full read-back) before it may claim
++     * HIFI_ACTIVE again.
++     *
++     * The caller (enable_audio_route) is on the select_devices() path; the
++     * actual return to SND_DEVICE_OUT_HEADPHONES happens on the next route
++     * decision, which is why ERROR_FALLBACK is a terminal state until then.
++     */
++    (void) leo_hifi_set_backend(lh);
++    if (lh->vol_applied || lh->vol_restore_pending)
++        (void) leo_hifi_restore_volume_floor(lh);
++
++    lh->generation++;
++    lh->effective = LEO_HIFI_ERROR_FALLBACK;
++    ALOGE("%s: gen=%llu fail=%d evidence=0x%x bypass=0x%x -> error_fallback",
++          __func__, lh->generation, lh->fail_code, lh->evidence, lh->bypass);
++}
++
++void leo_hifi_on_route(struct leo_hifi *lh, bool to_hifi_device)
++{
++    int vol[2];
++    pthread_mutex_lock(&lh->telemetry_lock);
++    leo_flow_reset(&lh->flow);
++    pthread_mutex_unlock(&lh->telemetry_lock);
++
++    if (!to_hifi_device) {
++        if ((lh->vol_applied || lh->vol_restore_pending) &&
++            leo_hifi_restore_volume_floor(lh) != 0) {
++            lh->generation++;
++            lh->effective = LEO_HIFI_ERROR_FALLBACK;
++            return;
++        }
++        /*
++         * Ordinary wired/speaker route.  The WCD chain being live here is
++         * normal and must never be reported as an error.
++         */
++        if (lh->effective == LEO_HIFI_ACTIVE ||
++            lh->effective == LEO_HIFI_DEGRADED ||
++            lh->effective == LEO_HIFI_ARMING ||
++            lh->effective == LEO_HIFI_ERROR_FALLBACK) {
++            lh->generation++;
++            lh->evidence = 0;
++            lh->bypass = 0;
++            lh->effective = LEO_HIFI_WIRED_STANDARD;
++            ALOGI("%s: gen=%llu -> wired_standard", __func__, lh->generation);
++        }
++        return;
++    }
++
++    lh->generation++;
++    lh->evidence = 0;
++    lh->bypass = 0;
++    if (lh->vol_restore_pending && leo_hifi_restore_volume_floor(lh) != 0) {
++        lh->effective = LEO_HIFI_ERROR_FALLBACK;
++        return;
++    }
++    lh->fail_code = LEO_FAIL_NONE;
++    lh->effective = LEO_HIFI_ARMING;
++
++    lh->evidence |= LEO_EV_E2;
++    if (lh->supported)
++        lh->evidence |= LEO_EV_E3;   /* proven by the probe that let us here */
++    lh->evidence |= LEO_EV_E9;
++
++    /* E4: the mixer path really enabled a QUAT front end. */
++    if (leo_quat_front_end_live(lh))
++        lh->evidence |= LEO_EV_E4;
++    else
++        lh->fail_code = LEO_FAIL_QUAT_NOT_ROUTED;
++
++    /* E6: the backend was written before the route; confirm it stuck. */
++    if (leo_hifi_set_backend(lh) == 0)
++        lh->evidence |= LEO_EV_E6;
++
++    /* E7: the volume control must read back inside the allowed window. */
++    if (leo_hifi_read_volume(lh, vol) == 0 &&
++        vol[0] == vol[1] &&
++        vol[0] >= LEO_HIFI_CTL_FLOOR && vol[0] <= LEO_HIFI_CTL_CEIL)
++        lh->evidence |= LEO_EV_E7;
++
++    /* E5: the decisive one -- no complete WCD path to the jack. */
++    if (leo_hifi_check_bypass(lh))
++        lh->evidence |= LEO_EV_E5;
++
++    if ((lh->evidence & LEO_EV_FATAL_MASK) != LEO_EV_FATAL_MASK) {
++        leo_hifi_fallback(lh);
++        return;
++    }
++
++    if ((lh->evidence & LEO_EV_E7) == 0) {
++        lh->effective = LEO_HIFI_DEGRADED;
++        ALOGW("%s: gen=%llu evidence=0x%x bypass=0x%x -> hifi_degraded",
++              __func__, lh->generation, lh->evidence, lh->bypass);
++        return;
++    }
++
++    lh->effective = LEO_HIFI_ACTIVE;
++    ALOGI("%s: gen=%llu evidence=0x%x bypass=0x%x -> hifi_active",
++          __func__, lh->generation, lh->evidence, lh->bypass);
++}
++
++void leo_hifi_on_route_off(struct leo_hifi *lh)
++{
++    int restored = 0;
++    if (lh->vol_applied || lh->vol_restore_pending)
++        restored = leo_hifi_restore_volume_floor(lh);
++    lh->generation++;
++    lh->evidence = 0;
++    pthread_mutex_lock(&lh->telemetry_lock);
++    leo_flow_reset(&lh->flow);
++    pthread_mutex_unlock(&lh->telemetry_lock);
++    lh->bypass = 0;
++    lh->effective = restored == 0 ? LEO_HIFI_IDLE : LEO_HIFI_ERROR_FALLBACK;
++    ALOGI("%s: gen=%llu -> idle", __func__, lh->generation);
++}
++
++static void leo_hifi_eval_state(struct leo_hifi *lh, bool *out_live, bool *out_flow) {
++    *out_live = false;
++    *out_flow = false;
++    if (!lh->supported || !lh->requested || lh->vol_restore_pending || lh->effective != LEO_HIFI_ACTIVE || lh->fail_code != LEO_FAIL_NONE || !leo_ess_bound())
++        return;
++        
++    int vol0 = -1, vol1 = -1;
++    if (lh->ctl_volume != NULL) {
++        vol0 = mixer_ctl_get_value(lh->ctl_volume, 0);
++        vol1 = mixer_ctl_get_value(lh->ctl_volume, 1);
++    }
++    
++    bool quat_on = lh->ctl_quat_mm[0] && mixer_ctl_get_value(lh->ctl_quat_mm[0], 0) == 1;
++    bool dac_off = lh->ctl_hphl_dac && mixer_ctl_get_value(lh->ctl_hphl_dac, 0) == 0;
++    bool backend_ok = false;
++    if (lh->ctl_quat_bw && lh->ctl_quat_sr) {
++        int v_bw = mixer_ctl_get_value(lh->ctl_quat_bw, 0);
++        const char *s_bw = (v_bw >= 0) ? mixer_ctl_get_enum_string(lh->ctl_quat_bw, v_bw) : NULL;
++        int v_sr = mixer_ctl_get_value(lh->ctl_quat_sr, 0);
++        const char *s_sr = (v_sr >= 0) ? mixer_ctl_get_enum_string(lh->ctl_quat_sr, v_sr) : NULL;
++        if (s_bw && strcmp(s_bw, LEO_HIFI_BITWIDTH_STR) == 0 &&
++            s_sr && strcmp(s_sr, LEO_HIFI_SAMPLERATE_STR) == 0) {
++            backend_ok = true;
++        }
++    }
++    
++    if (quat_on && dac_off && backend_ok && vol0 >= LEO_HIFI_CTL_FLOOR && vol0 <= LEO_HIFI_CTL_CEIL && vol0 == vol1) {
++        *out_live = true;
++    }
++    
++    struct timespec now;
++    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
++        int64_t ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
++        pthread_mutex_lock(&lh->telemetry_lock);
++        *out_flow = *out_live && leo_flow_live(&lh->flow, ms);
++        pthread_mutex_unlock(&lh->telemetry_lock);
++    }
++}
++
++static bool parse_uint63(const char *str, unsigned long long *out) {
++    if (!str || !*str) return false;
++    unsigned long long val = 0;
++    for (int i = 0; str[i]; i++) {
++        if (str[i] < '0' || str[i] > '9') return false;
++        unsigned int digit = (unsigned int)(str[i] - '0');
++        if (val > (9223372036854775807ULL - digit) / 10ULL) return false;
++        val = val * 10ULL + digit;
++    }
++    if (val > 9223372036854775807ULL) return false;
++    *out = val;
++    return true;
++}
++
++int leo_hifi_process_request(struct leo_hifi *lh, const char *mode_str, const char *vol_str, const char *sess_str, const char *gen_str, bool *mode_changed) {
++    if (mode_changed) *mode_changed = false;
++    if (!lh) return -EINVAL;
++    /* Caller holds adev->lock across validation, mutation and route selection. */
++    if (!mode_str && !vol_str) return -EINVAL;
++    if (mode_str && vol_str) return -EINVAL;
++    if (!sess_str || !gen_str) return -EINVAL;
++    
++    unsigned long long session, gen;
++    if (!parse_uint63(sess_str, &session) || session == 0) return -EINVAL;
++    if (!parse_uint63(gen_str, &gen)) return -EINVAL;
++    
++    int vol_val = 0;
++    bool mode_val = false;
++    
++    if (vol_str) {
++        if (vol_str[0] == '0' && vol_str[1] != '\0') return -EINVAL;
++        unsigned long long v;
++        if (!parse_uint63(vol_str, &v) || v > 60) return -EINVAL;
++        vol_val = (int)v;
++    }
++    
++    if (mode_str) {
++        if (strcmp(mode_str, "true") == 0) mode_val = true;
++        else if (strcmp(mode_str, "false") == 0) mode_val = false;
++        else return -EINVAL;
++    }
++    
++    pthread_mutex_lock(&lh->telemetry_lock);
++    unsigned long long current_session = lh->session;
++    pthread_mutex_unlock(&lh->telemetry_lock);
++    
++    if (session != current_session || gen != lh->generation) return -EAGAIN;
++    
++    if (vol_str) {
++        bool is_live, flow_active;
++        if (!lh->requested || lh->effective != LEO_HIFI_ACTIVE || lh->fail_code != LEO_FAIL_NONE) return -EAGAIN;
++        leo_hifi_eval_state(lh, &is_live, &flow_active);
++        if (!flow_active) return -EAGAIN;
++        
++        int ret = leo_hifi_apply_volume(lh, vol_val);
++        return (ret == 0) ? 0 : ret;
++    }
++    
++    if (mode_str) {
++        if (leo_hifi_set_mode(lh, mode_val)) {
++            if (mode_changed) *mode_changed = true;
++        }
++        return 0;
++    }
++    
++    return -EINVAL;
++}
++
++int leo_hifi_status_string(struct leo_hifi *lh, char *buf, size_t len)
++{
++    const char *sign = "";
++    int vol0 = -1, vol1 = -1, whole = 0, tenth = 0;
++    bool is_live = false, flow_active = false;
++    const char *backend_str = "unconfirmed";
++    unsigned long long current_session = 0;
++    int v_bw = -1, v_sr = -1;
++    const char *s_bw = NULL, *s_sr = NULL;
++
++    if (lh->supported && lh->ctl_volume != NULL) {
++        vol0 = mixer_ctl_get_value(lh->ctl_volume, 0);
++        vol1 = mixer_ctl_get_value(lh->ctl_volume, 1);
++    }
++    if (vol0 >= 0)
++        leo_hifi_ctl_to_db(vol0, &sign, &whole, &tenth);
++
++    if (lh->ctl_quat_bw && lh->ctl_quat_sr) {
++        v_bw = mixer_ctl_get_value(lh->ctl_quat_bw, 0);
++        s_bw = (v_bw >= 0) ? mixer_ctl_get_enum_string(lh->ctl_quat_bw, v_bw) : NULL;
++        v_sr = mixer_ctl_get_value(lh->ctl_quat_sr, 0);
++        s_sr = (v_sr >= 0) ? mixer_ctl_get_enum_string(lh->ctl_quat_sr, v_sr) : NULL;
++
++        if (s_bw && strcmp(s_bw, LEO_HIFI_BITWIDTH_STR) == 0 &&
++            s_sr && strcmp(s_sr, LEO_HIFI_SAMPLERATE_STR) == 0) {
++            backend_str = LEO_HIFI_BITWIDTH_STR "/" LEO_HIFI_SAMPLERATE_STR;
++        }
++    }
++
++    leo_hifi_eval_state(lh, &is_live, &flow_active);
++
++    pthread_mutex_lock(&lh->telemetry_lock);
++    current_session = lh->session;
++    pthread_mutex_unlock(&lh->telemetry_lock);
++
++    if (!buf || len == 0) return -EINVAL;
++    int n = snprintf(buf, len,
++             "schema:4,session:%llu,gen:%llu,supported:%d,requested:%s,"
++             "effective:%s,live:%d,flow:%d,vol_ctl_l:%d,vol_ctl_r:%d,"
++             "vol_db:%s%d.%d,vol_user:%d,backend:%s,fail:%d,"
++             "permanent_fail:%d,probes:%d,ev:0x%x,bypass:0x%x,vol_applied:%d,"
++             "restore_pending:%d,acdb:absent_expected",
++             current_session, lh->generation, lh->supported ? 1 : 0,
++             lh->requested ? "hifi" : "standard",
++             leo_state_name(lh->effective),
++             is_live ? 1 : 0, flow_active ? 1 : 0,
++             vol0, vol1, sign, whole, tenth, lh->vol_user,
++             backend_str, lh->fail_code,
++             lh->permanent_fail ? 1 : 0, lh->probe_attempts,
++             lh->evidence, lh->bypass, lh->vol_applied ? 1 : 0,
++             lh->vol_restore_pending ? 1 : 0);
++    if (n < 0 || (size_t)n >= len) {
++        buf[0] = '\0'; /* Never publish a truncated, partially valid status. */
++        return -ENOSPC;
++    }
++    return 0;
++}
++
++unsigned long long leo_hifi_flow_token(struct leo_hifi *lh)
++{
++    unsigned long long token;
++    pthread_mutex_lock(&lh->telemetry_lock);
++    token = lh->flow.token;
++    pthread_mutex_unlock(&lh->telemetry_lock);
++    return token;
++}
++
++void leo_hifi_note_frames(struct leo_hifi *lh, unsigned long long token,
++                         uintptr_t stream, uint64_t written, unsigned int size,
++                         unsigned int avail, bool valid)
++{
++    struct timespec now;
++    int64_t ms = -1;
++    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
++        ms = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
++    pthread_mutex_lock(&lh->telemetry_lock);
++    leo_flow_sample(&lh->flow, token, stream, written, size, avail, valid, ms);
++    pthread_mutex_unlock(&lh->telemetry_lock);
++}
++
++void leo_hifi_destroy(struct leo_hifi *lh)
++{
++    pthread_mutex_destroy(&lh->telemetry_lock);
++}
+diff --git a/hal/msm8974/leo_hifi.h b/hal/msm8974/leo_hifi.h
+new file mode 100644
+index 0000000..c499dc9
+--- /dev/null
++++ b/hal/msm8974/leo_hifi.h
+@@ -0,0 +1,321 @@
++/*
++ * Copyright (C) 2026 The Leo Audio OS Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++/*
++ * Leo HiFi Controller -- Xiaomi Mi Note Pro (leo) only.
++ *
++ * Owns every write to the ESS9018K2M / QUAT_MI2S control surface.  Nothing
++ * else in the system (no app, no init script, no tinymix service) may write
++ * those controls.  See docs/19-PHASE-5B-M3-HIFI-CONTROLLER-CONTRACT.md.
++ *
++ * Default state is DISABLED: with vendor.leo.audio.hifi.enable unset the
++ * device behaves exactly like stock MoKee.
++ */
++
++#ifndef LEO_HIFI_H
++#define LEO_HIFI_H
++
++#include <stdbool.h>
++#include <stddef.h>
++#include <time.h>
++#include <stdint.h>
++#include "leo_hifi_flow.h"
++#include <pthread.h>
++#include <tinyalsa/asoundlib.h>
++
++/* mixer_paths.xml path suffix; must equal device_table[SND_DEVICE_OUT_LEO_HIFI_HEADPHONES] */
++#define LEO_HIFI_DEVICE_NAME        "hifi-headphones"
++#define LEO_HIFI_HW_INTERFACE       "QUAT_MI2S_RX"
++
++#define LEO_PROP_ENABLE             "vendor.leo.audio.hifi.enable"
++#define LEO_PROP_VOLUME             "vendor.leo.audio.hifi.volume"
++#define LEO_PROP_SUPPORTED          "vendor.leo.audio.hifi.supported"
++
++#define LEO_PARAM_KEY_MODE          "leo_hifi_mode"
++#define LEO_PARAM_KEY_VOLUME        "leo_hifi_volume"
++#define LEO_PARAM_KEY_STATUS        "leo_hifi_status"
++
++/*
++ * ES9018 "Volume" kcontrol, read out of the MoKee boot kernel image
++ * (snd_kcontrol_new -> soc_mixer_control + TLV):
++ *
++ *   min = 0, max = 255, reg = 15, rreg = 16, invert = 1
++ *   TLV = DB_SCALE(min = -127.50 dB, step = 0.50 dB)
++ *   => dB = -127.50 + 0.50 * ctl_value, higher control value == louder
++ *
++ * 205 is the mixer_paths.xml default (-25.0 dB) and is our absolute floor.
++ */
++#define LEO_HIFI_CTL_FLOOR          205     /* -25.0 dB, mixer_paths.xml default */
++#define LEO_HIFI_CTL_BASE           213     /* user 0   -> -21.0 dB              */
++#define LEO_HIFI_CTL_CEIL           237     /* user 60  ->  -9.0 dB, stage-1 cap */
++#define LEO_HIFI_VOL_MAX            60      /* user scale cap before R6/R7       */
++#define LEO_HIFI_VOL_STEP_MAX       5       /* max user units applied per frame  */
++
++/* Number of MultiMedia front ends to scan on both backends. */
++#define LEO_HIFI_MM_COUNT           16
++
++/*
++ * Bounded late re-probe.
++ *
++ * A single transient failure at platform_init() time (sound card registered
++ * before the ES9018 codec component bound, sysfs not yet populated) must not
++ * cost HiFi for the whole boot.  The probe is strictly read-only -- a stat()
++ * plus a handful of mixer_get_ctl_by_name() calls -- so retrying cannot pop,
++ * cannot re-route and costs no power.  A structural failure (device_table
++ * mismatch) is NOT retried: it can never fix itself and acting on it would
++ * mean writing to an unknown device.
++ */
++#define LEO_HIFI_PROBE_MAX          3
++
++typedef enum {
++    LEO_HIFI_IDLE = 0,
++    LEO_HIFI_SPEAKER,
++    LEO_HIFI_WIRED_STANDARD,
++    LEO_HIFI_ARMING,
++    LEO_HIFI_ACTIVE,
++    LEO_HIFI_DEGRADED,
++    LEO_HIFI_ERROR_FALLBACK,
++} leo_hifi_state_t;
++
++/* fail codes -- see docs/19 section 4.3 */
++enum {
++    LEO_FAIL_NONE             = 0,
++    LEO_FAIL_CTL_MISSING      = 1,
++    LEO_FAIL_CTL_WRITE        = 2,
++    LEO_FAIL_READBACK_FATAL   = 3,
++    LEO_FAIL_READBACK_SOFT    = 4,
++    LEO_FAIL_ESS_UNBOUND      = 5,
++    LEO_FAIL_WCD_BYPASS       = 6,
++    LEO_FAIL_BACKEND_RATE     = 7,
++    LEO_FAIL_TIMEOUT          = 8,
++    LEO_FAIL_VOL_RANGE        = 9,
++    LEO_FAIL_BACKEND_READBACK = 10,
++    LEO_FAIL_USECASE_UNKNOWN  = 11,
++    LEO_FAIL_TABLE_MISMATCH   = 12,
++    LEO_FAIL_QUAT_NOT_ROUTED  = 13,
++};
++
++struct leo_hifi {
++    bool                supported;      /* probe passed; controls resolved       */
++    bool                permanent_fail;  /* structural: never retry              */
++    int                 probe_attempts;
++    bool                requested;      /* policy intent (leo_hifi_mode)         */
++    leo_hifi_state_t    effective;      /* only advanced after read-back         */
++    unsigned long long  generation;
++    int                 fail_code;
++    unsigned int        evidence;       /* LEO_EV_* bitmap                       */
++    unsigned int        bypass;         /* LEO_BP_* bitmap, last observation     */
++
++    pthread_mutex_t     telemetry_lock;
++    unsigned long long  session;
++    struct leo_hifi_flow flow;
++
++    int                 vol_user;       /* 0..LEO_HIFI_VOL_MAX                   */
++    bool                vol_applied;    /* false until we have written "Volume"  */
++    bool                vol_restore_pending; /* only clear after verified 205/205 */
++
++    const char         *device_name;    /* device_table entry, for the self-check */
++    struct mixer       *mixer;
++    struct mixer_ctl   *ctl_volume;
++    struct mixer_ctl   *ctl_quat_bw;
++    struct mixer_ctl   *ctl_quat_sr;
++    struct mixer_ctl   *ctl_hphl_dac;
++    struct mixer_ctl   *ctl_slim_rx1_mux;
++    struct mixer_ctl   *ctl_slim_rx2_mux;
++    struct mixer_ctl   *ctl_rx1_mix1_inp1;
++    struct mixer_ctl   *ctl_rx2_mix1_inp1;
++    struct mixer_ctl   *ctl_class_h_mux;
++    struct mixer_ctl   *ctl_slim_mm[LEO_HIFI_MM_COUNT];
++    struct mixer_ctl   *ctl_quat_mm[LEO_HIFI_MM_COUNT];
++};
++
++/*
++ * Resolve every control we will ever touch and run the device_table
++ * self-check. After a successful probe, verify/recover the factory volume;
++ * saved user gain is never replayed. Never fails the caller: platform_init() must keep working on a
++ * device without an ES9018, and a failure here must never block Android boot
++ * or ordinary headphone playback.
++ */
++void leo_hifi_init(struct leo_hifi *lh, struct mixer *mixer,
++                   const char *device_table_name);
++
++/*
++ * True when the controller may select the HiFi output device.  Not const:
++ * when the intent is set but a previous probe failed transiently this performs
++ * one bounded, read-only re-probe (at most LEO_HIFI_PROBE_MAX per boot).
++ * Successful late binding or pending volume recovery also verifies/restores
++ * the factory floor before route selection. Caller must hold adev->lock.
++ */
++bool leo_hifi_route_wanted(struct leo_hifi *lh);
++
++/*
++ * Apply a new policy intent.  Returns true when the intent actually changed
++ * and the caller must re-run select_devices() for active playback usecases.
++ */
++bool leo_hifi_set_mode(struct leo_hifi *lh, bool enable);
++
++/* ---------------------------------------------------------------------- *
++ * Independent HiFi volume (ES9018 "Volume" kcontrol)
++ * ---------------------------------------------------------------------- */
++
++/* ctl = LEO_HIFI_CTL_BASE + (user * 2) / 5   =>   dB = -21.0 + 0.2 * user */
++static inline int leo_hifi_user_to_ctl(int user)
++{
++    return LEO_HIFI_CTL_BASE + (user * 2) / 5;
++}
++
++/*
++ * Exact, sign-safe dB decomposition.  dB = -127.50 + 0.50 * v, so the value in
++ * tenths of a dB is exactly (5 * v - 1275).  Everything is integer: C division
++ * truncates toward zero, which silently drops the sign for values in
++ * (-1.0, 0.0), so the sign is carried separately instead of being derived from
++ * the quotient.  Print with "%s%d.%d" and the returned sign string.
++ */
++void leo_hifi_ctl_to_db(int ctl_value, const char **sign, int *whole, int *tenth);
++
++/*
++ * Read the current control value into out[2].  Returns 0 on success.
++ * Never writes anything.
++ */
++int leo_hifi_read_volume(struct leo_hifi *lh, int out[2]);
++
++/*
++ * Clamp, apply and read back.  Returns 0 on success, -EINVAL when the
++ * request is out of range (fail_code LEO_FAIL_VOL_RANGE, value unchanged),
++ * -EIO when the write or readback fails. Recovery to LEO_HIFI_CTL_FLOOR is
++ * attempted; vol_restore_pending remains true if it cannot be confirmed.
++ *
++ * Large jumps are split into bounded frames; the ES9018 has its own
++ * "Volume Ramp Rate" but we do not rely on it alone.
++ */
++int leo_hifi_apply_volume(struct leo_hifi *lh, int user_vol);
++
++/* Verify/restore 205/205. Never clear vol_restore_pending on an unproven write. */
++int leo_hifi_restore_volume_floor(struct leo_hifi *lh);
++
++/* ---------------------------------------------------------------------- *
++ * Deterministic QUAT_MI2S backend
++ * ---------------------------------------------------------------------- */
++
++/*
++ * Stage-1 targets.  M3 pins the backend at the 48 kHz clock family; 44.1 kHz
++ * is M3.5 and must not be attempted here.  "Leaving the control alone" is NOT
++ * equivalent to "correct": upstream has no teardown reset for these controls,
++ * so a previous non-48 kHz session can leave a stale value behind.
++ *
++ * Nothing else in the HAL writes QUAT_MI2S BitWidth / SampleRate (verified by
++ * grep over the whole hardware/qcom-caf/msm8994/audio tree at 7f4cac74), and
++ * the kernel machine driver samples both kcontrols at hw_params time, i.e.
++ * when the QUAT DAI starts.  The write must therefore happen BEFORE the mixer
++ * path that enables QUAT_MI2S_RX is applied.
++ */
++#define LEO_HIFI_BITWIDTH_STR       "S24_LE"
++#define LEO_HIFI_SAMPLERATE_STR     "KHZ_48"
++
++/*
++ * Write BitWidth then SampleRate and read both back.  Returns 0 only when
++ * both read-backs match.  Idempotent, so repeated calls across several
++ * usecases on the same device are harmless.
++ */
++int leo_hifi_set_backend(struct leo_hifi *lh);
++
++/*
++ * Entry hook, called from enable_snd_device() with the NEW device.
++ *
++ * It must not be called from platform_check_and_set_codec_backend_cfg():
++ * at that point select_devices() has not yet assigned usecase->out_snd_device,
++ * so the usecase still carries the PREVIOUS device and the guard would test
++ * the wrong edge.
++ */
++void platform_leo_hifi_snd_device_enabled(void *platform, int snd_device);
++
++/* Exit-side hook called from disable_audio_route(); never blocks teardown. */
++void platform_leo_hifi_backend_exit(void *platform, int snd_device);
++
++/* ---------------------------------------------------------------------- *
++ * WCD bypass detection, state machine and read-only status
++ * ---------------------------------------------------------------------- */
++
++/* Evidence bits, mirrored into the leo_hifi_status string. */
++#define LEO_EV_E2       (1u << 1)   /* HiFi snd_device selected               */
++#define LEO_EV_E3       (1u << 2)   /* ES9018 bound on I2C 6-0048             */
++#define LEO_EV_E4       (1u << 3)   /* a QUAT_MI2S_RX front end is On         */
++#define LEO_EV_E5       (1u << 4)   /* no complete WCD path to the jack       */
++#define LEO_EV_E6       (1u << 5)   /* QUAT backend read back as targeted     */
++#define LEO_EV_E7       (1u << 6)   /* ES9018 Volume read back as expected    */
++#define LEO_EV_E9       (1u << 7)   /* no control write failure this gen      */
++
++#define LEO_EV_FATAL_MASK \
++    (LEO_EV_E2 | LEO_EV_E3 | LEO_EV_E4 | LEO_EV_E5 | LEO_EV_E6 | LEO_EV_E9)
++
++/*
++ * Bypass observation bits.  These describe the WCD9330 chain
++ *   MultiMediaN -> SLIMBUS_0_RX -> SLIM RXn MUX -> RXn MIX1 INP1
++ *                -> CLASS_H_DSM MUX -> HPHL DAC Switch -> jack
++ * Only LEO_BP_OUTLET is fatal on its own: M2 proved on the real device that
++ * cutting the analog outlet silences the WCD path even while
++ * SLIMBUS_0_RX <- MultiMedia5 is still On.  Everything else is recorded as a
++ * bypass *attempt*, which is diagnostic, not proof of audible sound.
++ */
++#define LEO_BP_SLIM_FE  (1u << 0)   /* some SLIMBUS_0_RX <- MultiMediaN On    */
++#define LEO_BP_MUX_LIVE (1u << 1)   /* SLIM RX1 or RX2 MUX != ZERO            */
++#define LEO_BP_MIX_LIVE (1u << 2)   /* RX1 or RX2 MIX1 INP1 != ZERO           */
++#define LEO_BP_CLASSH   (1u << 3)   /* CLASS_H_DSM MUX != ZERO                */
++#define LEO_BP_OUTLET   (1u << 4)   /* HPHL DAC Switch On -- FATAL            */
++
++#define LEO_BP_FATAL_MASK   (LEO_BP_OUTLET)
++
++/*
++ * Observe the WCD chain.  Returns true when no FATAL bypass condition is
++ * present.  Always fills lh->bypass with everything it saw, so a non-fatal
++ * "bypass attempt" is visible in the status string without changing state.
++ *
++ * This is only meaningful while the HiFi device is selected.  In the ordinary
++ * WIRED_STANDARD case the WCD chain is supposed to be live, and the state
++ * machine does not call this at all.
++ */
++bool leo_hifi_check_bypass(struct leo_hifi *lh);
++
++/*
++ * State machine entry points.  leo_hifi_on_route() runs the full read-back
++ * sequence and decides between HIFI_ACTIVE, HIFI_DEGRADED and
++ * ERROR_FALLBACK; it never advances to HIFI_ACTIVE on stale evidence because
++ * every call starts a new generation and re-reads everything.
++ */
++void leo_hifi_on_route(struct leo_hifi *lh, bool to_hifi_device);
++void leo_hifi_on_route_off(struct leo_hifi *lh);
++
++/* Render the read-only status snapshot into buf (never fails). */
++/* Schema4 inner payload; return 0 only for complete output, otherwise empty. */
++int leo_hifi_status_string(struct leo_hifi *lh, char *buf, size_t len);
++
++int leo_hifi_process_request(struct leo_hifi *lh, const char *mode_str, const char *vol_str, const char *sess_str, const char *gen_str, bool *mode_changed);
++
++/* Thin wrappers defined in platform.c and called from audio_hw.c. */
++void platform_leo_hifi_route_enabled(void *platform, int snd_device);
++void platform_leo_hifi_route_disabled(void *platform, int snd_device);
++unsigned long long platform_leo_hifi_flow_token(void *platform);
++void platform_leo_hifi_note_frames(void *platform, unsigned long long token,
++                                  uintptr_t stream, uint64_t written,
++                                  unsigned int size, unsigned int avail, bool valid);
++
++unsigned long long leo_hifi_flow_token(struct leo_hifi *lh);
++void leo_hifi_note_frames(struct leo_hifi *lh, unsigned long long token,
++                         uintptr_t stream, uint64_t written, unsigned int size,
++                         unsigned int avail, bool valid);
++void leo_hifi_destroy(struct leo_hifi *lh);
++
++#endif /* LEO_HIFI_H */
+diff --git a/hal/msm8974/leo_hifi_flow.h b/hal/msm8974/leo_hifi_flow.h
+new file mode 100644
+index 0000000..70afd8e
+--- /dev/null
++++ b/hal/msm8974/leo_hifi_flow.h
+@@ -0,0 +1,46 @@
++#ifndef LEO_HIFI_FLOW_H
++#define LEO_HIFI_FLOW_H
++#include <stdint.h>
++#include <stdbool.h>
++/* Caller owns the telemetry mutex. No mixer access and no stream/adev lock acquisition. */
++struct leo_hifi_flow {
++    uint64_t token, presented;
++    uintptr_t stream;
++    int64_t observed_ms;
++    unsigned int advances;
++    bool valid;
++};
++static inline void leo_flow_reset(struct leo_hifi_flow *f)
++{
++    f->token++;
++    if (f->token == 0) f->token = 1;
++    f->valid = false;
++    f->advances = 0;
++}
++static inline bool leo_flow_live(const struct leo_hifi_flow *f, int64_t now)
++{
++    return f->valid && f->advances >= 2 && now >= f->observed_ms
++        && now - f->observed_ms <= 2000;
++}
++static inline void leo_flow_sample(struct leo_hifi_flow *f, uint64_t token,
++        uintptr_t stream, uint64_t written, unsigned int size, unsigned int avail,
++        bool valid, int64_t now)
++{
++    uint64_t presented;
++    if (token != f->token || token == 0) return; /* old route cannot update the new one */
++    if (!valid || now < 0 || size == 0 || avail > size || written < size - avail) {
++        f->valid = false; f->advances = 0; return;
++    }
++    presented = written - (size - avail);
++    if (!f->valid || stream != f->stream || presented < f->presented
++            || now < f->observed_ms || now - f->observed_ms > 2000) {
++        f->advances = 0;
++    } else if (presented > f->presented) {
++        if (f->advances < 2) f->advances++;
++    } else {
++        f->advances = 0;
++    }
++    f->valid = true; f->presented = presented; f->stream = stream;
++    f->observed_ms = now;
++}
++#endif
+diff --git a/hal/msm8974/platform.c b/hal/msm8974/platform.c
+index 4645fd2..81b958e 100644
+--- a/hal/msm8974/platform.c
++++ b/hal/msm8974/platform.c
+@@ -40,6 +40,9 @@
+ #include "audio_extn.h"
+ #include "voice_extn.h"
+ #include "edid.h"
++#ifdef LEO_HIFI_ENABLED
++#include "leo_hifi.h"
++#endif
+ #include "sound/compress_params.h"
+ #include "sound/msmcal-hwdep.h"
+ 
+@@ -206,6 +209,11 @@ struct platform_data {
+     int max_mic_count;
+ 
+     int max_vol_index;
++
++#ifdef LEO_HIFI_ENABLED
++    /* Leo HiFi controller state; sole owner of the ES9018 control surface. */
++    struct leo_hifi leo;
++#endif
+ };
+ 
+ static bool is_external_codec = false;
+@@ -322,6 +330,17 @@ static char * device_table[SND_DEVICE_MAX] = {
+     [SND_DEVICE_OUT_ANC_HANDSET] = "anc-handset",
+     [SND_DEVICE_OUT_SPEAKER_PROTECTED] = "speaker-protected",
+     [SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED] = "voice-speaker-protected",
++    /*
++     * Must match the <path name="... hifi-headphones"> family already present
++     * in the Leo device tree mixer_paths.xml (sha256 13db0e6e...4bb4, verified
++     * byte-identical to the stock MIUI file).  Note that only four usecases
++     * have such a path: deep-buffer, low-latency, audio-ull and
++     * compress-offload.  Any other usecase routed here finds no path, so the
++     * controller's E4 read-back is what catches it.
++     */
++#ifdef LEO_HIFI_ENABLED
++    [SND_DEVICE_OUT_LEO_HIFI_HEADPHONES] = "hifi-headphones",
++#endif
+ 
+     /* Capture sound devices */
+     [SND_DEVICE_IN_HANDSET_MIC] = "handset-mic",
+@@ -392,6 +411,21 @@ static char * device_table[SND_DEVICE_MAX] = {
+ static int backend_bit_width_table[SND_DEVICE_MAX] = {0};
+ 
+ /* ACDB IDs (audio DSP path configuration IDs) for each sound device */
++/*
++ * Leo: structural guards.  C89-compatible compile-time assertions (negative
++ * array size on failure) so they hold regardless of -std.
++ *
++ * Rationale: MIUI numbering differs from this tree (MIUI headphones=6 /
++ * hifi-headphones=34; here line=6 / headphones=7 and 34 is
++ * SND_DEVICE_OUT_SPEAKER_PROTECTED).  Nothing may depend on a literal number.
++ */
++#ifdef LEO_HIFI_ENABLED
++typedef char leo_assert_hifi_dev_in_out_range[
++        (SND_DEVICE_OUT_LEO_HIFI_HEADPHONES < SND_DEVICE_OUT_END) ? 1 : -1];
++typedef char leo_assert_out_in_boundary[
++        (SND_DEVICE_OUT_END == SND_DEVICE_IN_BEGIN) ? 1 : -1];
++#endif
++
+ static int acdb_device_table[SND_DEVICE_MAX] = {
+     [SND_DEVICE_NONE] = -1,
+     [SND_DEVICE_OUT_HANDSET] = 7,
+@@ -429,6 +463,18 @@ static int acdb_device_table[SND_DEVICE_MAX] = {
+     [SND_DEVICE_OUT_ANC_HANDSET] = 103,
+     [SND_DEVICE_OUT_SPEAKER_PROTECTED] = 124,
+     [SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED] = 101,
++    /*
++     * Leo: hifi-headphones intentionally has NO ACDB entry.
++     *
++     * Neither the stock MIUI nor the MoKee audio_platform_info*.xml declares
++     * an acdb_id for this device, and the stock MIUI HAL runs the ESS path
++     * with a "device has no ACDB ID" warning.  Absence is factory behaviour.
++     * Do NOT borrow the acdb id of SND_DEVICE_OUT_HEADPHONES or any other
++     * device: that calibration is tuned for the WCD9330 analog chain.
++     */
++#ifdef LEO_HIFI_ENABLED
++    [SND_DEVICE_OUT_LEO_HIFI_HEADPHONES] = -1,
++#endif
+ 
+     [SND_DEVICE_IN_HANDSET_MIC] = 4,
+     [SND_DEVICE_IN_HANDSET_MIC_EXTERNAL] = 4,
+@@ -537,6 +583,9 @@ static struct name_to_index snd_device_name_index[SND_DEVICE_MAX] = {
+     {TO_NAME_INDEX(SND_DEVICE_OUT_ANC_HANDSET)},
+     {TO_NAME_INDEX(SND_DEVICE_OUT_SPEAKER_PROTECTED)},
+     {TO_NAME_INDEX(SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED)},
++#ifdef LEO_HIFI_ENABLED
++    {TO_NAME_INDEX(SND_DEVICE_OUT_LEO_HIFI_HEADPHONES)},
++#endif
+     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_MIC)},
+     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_MIC_EXTERNAL)},
+     {TO_NAME_INDEX(SND_DEVICE_IN_HANDSET_MIC_AEC)},
+@@ -945,6 +994,25 @@ static void set_platform_defaults(struct platform_data * my_data)
+     hw_interface_table[SND_DEVICE_OUT_VOICE_TX] = strdup("AFE_PCM_RX");
+     hw_interface_table[SND_DEVICE_OUT_SPEAKER_PROTECTED] = strdup("SLIMBUS_0_RX");
+     hw_interface_table[SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED] = strdup("SLIMBUS_0_RX");
++#ifdef LEO_HIFI_ENABLED
++    /*
++     * Leo: the HiFi output lives on its own backend.
++     *
++     * backend_tag_table turns the mixer path into "<usecase> hifi-headphones",
++     * which is exactly what the Leo device tree mixer_paths.xml provides.
++     *
++     * hw_interface_table is what platform_check_backends_match() compares (by
++     * mutual strstr): "QUAT_MI2S_RX" and "SLIMBUS_0_RX" share no substring, so
++     * the two are correctly reported as different backends and
++     * check_and_route_playback_usecases() will not drag SLIMBUS usecases onto
++     * the ESS path.  The flip side -- a concurrent SLIMBUS stream keeps the
++     * WCD analog outlet open -- is handled by the bypass assertion in 0005.
++     */
++    backend_tag_table[SND_DEVICE_OUT_LEO_HIFI_HEADPHONES] =
++            strdup(LEO_HIFI_DEVICE_NAME);
++    hw_interface_table[SND_DEVICE_OUT_LEO_HIFI_HEADPHONES] =
++            strdup(LEO_HIFI_HW_INTERFACE);
++#endif
+ 
+     if (is_external_codec) {
+         my_data->max_mic_count = PLATFORM_DEFAULT_EXTERNAL_CODEC_MIC_COUNT;
+@@ -1366,6 +1434,16 @@ acdb_init_fail:
+     audio_extn_dev_arbi_init();
+ 
+     my_data->edid_info = NULL;
++
++#ifdef LEO_HIFI_ENABLED
++    /*
++     * Leo HiFi controller.  Never fails platform_init(): on any problem it
++     * marks itself unsupported and the device keeps stock behaviour.
++     */
++    leo_hifi_init(&my_data->leo, adev->mixer,
++                  device_table[SND_DEVICE_OUT_LEO_HIFI_HEADPHONES]);
++#endif
++
+     return my_data;
+ }
+ 
+@@ -1397,6 +1475,10 @@ void platform_deinit(void *platform)
+     /* deinit audio device arbitration */
+     audio_extn_dev_arbi_deinit();
+ 
++#ifdef LEO_HIFI_ENABLED
++    leo_hifi_destroy(&my_data->leo);
++#endif
++
+     if (my_data->edid_info) {
+         free(my_data->edid_info);
+         my_data->edid_info = NULL;
+@@ -1408,6 +1490,22 @@ void platform_deinit(void *platform)
+     audio_extn_dap_hal_deinit();
+ }
+ 
++#ifdef LEO_HIFI_ENABLED
++unsigned long long platform_leo_hifi_flow_token(void *platform)
++{
++    struct platform_data *my_data = (struct platform_data *)platform;
++    return my_data ? leo_hifi_flow_token(&my_data->leo) : 0;
++}
++
++void platform_leo_hifi_note_frames(void *platform, unsigned long long token,
++                                  uintptr_t stream, uint64_t written,
++                                  unsigned int size, unsigned int avail, bool valid)
++{
++    struct platform_data *my_data = (struct platform_data *)platform;
++    if (my_data) leo_hifi_note_frames(&my_data->leo, token, stream, written, size, avail, valid);
++}
++#endif
++
+ const char *platform_get_snd_device_name(snd_device_t snd_device)
+ {
+     if (snd_device >= SND_DEVICE_MIN && snd_device < SND_DEVICE_MAX)
+@@ -2090,7 +2188,21 @@ snd_device_t platform_get_output_snd_device(void *platform, audio_devices_t devi
+                 snd_device = SND_DEVICE_OUT_ANC_FB_HEADSET;
+             else
+                 snd_device = SND_DEVICE_OUT_ANC_HEADSET;
+-        } else
++        }
++#ifdef LEO_HIFI_ENABLED
++        else if (leo_hifi_route_wanted(&my_data->leo)) {
++            /*
++             * Leo: route wired headphone playback through
++             * QUAT_MI2S -> ES9018K2M -> OPA1612.  The decision is a single
++             * boolean owned by the Leo HiFi controller; no impedance, format
++             * or stream property takes part (the stock MIUI HAL behaves the
++             * same way).  Whether the route actually took effect is decided
++             * later by read-back, never here.
++             */
++            snd_device = SND_DEVICE_OUT_LEO_HIFI_HEADPHONES;
++        }
++#endif
++        else
+             snd_device = SND_DEVICE_OUT_HEADPHONES;
+     } else if (devices & AUDIO_DEVICE_OUT_LINE) {
+         snd_device = SND_DEVICE_OUT_LINE;
+@@ -2786,6 +2898,68 @@ int platform_set_parameters(void *platform, struct str_parms *parms)
+         ALOGE("[%s] failed to allocate memory",__func__);
+         goto done;
+     }
++#ifdef LEO_HIFI_ENABLED
++    {
++        char *mode_val = NULL, *vol_val = NULL, *sess_val = NULL, *gen_val = NULL;
++        int has_mode = str_parms_get_str(parms, LEO_PARAM_KEY_MODE, value, len) >= 0;
++        if (has_mode) mode_val = strdup(value);
++        
++        int has_vol = str_parms_get_str(parms, LEO_PARAM_KEY_VOLUME, value, len) >= 0;
++        if (has_vol) vol_val = strdup(value);
++        
++        int has_sess = str_parms_get_str(parms, "leo_hifi_session", value, len) >= 0;
++        if (has_sess) sess_val = strdup(value);
++        
++        int has_gen = str_parms_get_str(parms, "leo_hifi_gen", value, len) >= 0;
++        if (has_gen) gen_val = strdup(value);
++
++        if (has_mode || has_vol || has_sess || has_gen) {
++            if (has_mode) str_parms_del(parms, LEO_PARAM_KEY_MODE);
++            if (has_vol) str_parms_del(parms, LEO_PARAM_KEY_VOLUME);
++            if (has_sess) str_parms_del(parms, "leo_hifi_session");
++            if (has_gen) str_parms_del(parms, "leo_hifi_gen");
++
++            bool mode_changed = false;
++            int hifi_ret = ((has_mode && !mode_val) || (has_vol && !vol_val)
++                    || (has_sess && !sess_val) || (has_gen && !gen_val)) ? -ENOMEM
++                    : leo_hifi_process_request(&my_data->leo, mode_val, vol_val,
++                            sess_val, gen_val, &mode_changed);
++            
++            if (mode_val) free(mode_val);
++            if (vol_val) free(vol_val);
++            if (sess_val) free(sess_val);
++            if (gen_val) free(gen_val);
++
++            if (hifi_ret != 0) {
++                ret = hifi_ret;
++                goto done;
++            }
++
++            if (mode_changed) {
++                audio_usecase_t ids[AUDIO_USECASE_MAX];
++                struct listnode *node;
++                struct audio_usecase *uc;
++                int n = 0, k;
++
++                /*
++                 * Snapshot the ids first.  select_devices() calls
++                 * disable_audio_route()/enable_audio_route() and can recurse into
++                 * itself for the capture usecase, so iterating adev->usecase_list
++                 * while calling it would be walking a list the callee may touch.
++                 * adev->lock is already held by adev_set_parameters().
++                 */
++                list_for_each(node, &my_data->adev->usecase_list) {
++                    uc = node_to_item(node, struct audio_usecase, list);
++                    if (uc->type == PCM_PLAYBACK && n < AUDIO_USECASE_MAX)
++                        ids[n++] = uc->id;
++                }
++                for (k = 0; k < n; k++)
++                    select_devices(my_data->adev, ids[k]);
++            }
++        }
++    }
++#endif
++
+     err = str_parms_get_str(parms, AUDIO_PARAMETER_KEY_SLOWTALK, value, len);
+     if (err >= 0) {
+         bool state = false;
+@@ -3068,6 +3242,21 @@ void platform_get_parameters(void *platform,
+     int ret;
+     char *kv_pairs = NULL;
+ 
++#ifdef LEO_HIFI_ENABLED
++    ret = str_parms_get_str(query, LEO_PARAM_KEY_STATUS, value, sizeof(value));
++    if (ret >= 0) {
++        char status[512];
++
++        /*
++         * Read-only snapshot for Leo Home and the maintenance page.  Unknown
++         * fields are reported as -1 / "unconfirmed"; we never fill in a guess,
++         * and the UI must not infer effective state from requested state.
++         */
++        if (leo_hifi_status_string(&my_data->leo, status, sizeof(status)) == 0)
++            str_parms_add_str(reply, LEO_PARAM_KEY_STATUS, status);
++    }
++#endif
++
+     ret = str_parms_get_str(query, AUDIO_PARAMETER_KEY_SLOWTALK,
+                             value, sizeof(value));
+     if (ret >= 0) {
+@@ -3390,6 +3579,89 @@ bool platform_check_codec_backend_cfg(struct audio_device* adev,
+     return backend_change;
+ }
+ 
++#ifdef LEO_HIFI_ENABLED
++/*
++ * Leo: state-machine entry point, called from enable_audio_route() after the
++ * mixer path has been applied.  Runs the full read-back sequence, including
++ * the WCD bypass observation, and decides HIFI_ACTIVE / HIFI_DEGRADED /
++ * ERROR_FALLBACK.  Never advances on stale evidence: each call starts a new
++ * generation and re-reads everything.
++ */
++void platform_leo_hifi_route_enabled(void *platform, int snd_device)
++{
++    struct platform_data *my_data = (struct platform_data *)platform;
++
++    if (my_data == NULL)
++        return;
++
++    leo_hifi_on_route(&my_data->leo,
++                      snd_device == SND_DEVICE_OUT_LEO_HIFI_HEADPHONES);
++}
++
++void platform_leo_hifi_route_disabled(void *platform, int snd_device)
++{
++    struct platform_data *my_data = (struct platform_data *)platform;
++
++    if (my_data == NULL || snd_device != SND_DEVICE_OUT_LEO_HIFI_HEADPHONES)
++        return;
++
++    leo_hifi_on_route_off(&my_data->leo);
++}
++
++/*
++ * Leo: entry-side backend configuration, called from enable_snd_device() with
++ * the NEW sound device.
++ *
++ * It deliberately does NOT live in platform_check_and_set_codec_backend_cfg().
++ * select_devices() calls check_and_route_playback_usecases() -- and therefore
++ * that function -- BEFORE it assigns usecase->out_snd_device, so at that point
++ * the usecase still carries the previous device and a guard on it would fire
++ * on the wrong edge (never on entry, always on exit).
++ *
++ * Order inside select_devices():
++ *      disable_audio_route(old)            <- exit hook runs here
++ *      disable_snd_device(old)
++ *      check_and_route_playback_usecases(new)
++ *      enable_snd_device(new)              <- THIS hook runs here
++ *      usecase->out_snd_device = new
++ *      enable_audio_route(new)             <- QUAT DAI actually starts here
++ *
++ * The kernel machine driver samples QUAT_MI2S BitWidth / SampleRate at
++ * hw_params time, i.e. when the mixer path started by enable_audio_route()
++ * brings the DAI up.  Writing here is therefore both early enough and not too
++ * early; the controls are static kcontrols that exist from card registration.
++ */
++void platform_leo_hifi_snd_device_enabled(void *platform, int snd_device)
++{
++    struct platform_data *my_data = (struct platform_data *)platform;
++
++    if (my_data == NULL || snd_device != SND_DEVICE_OUT_LEO_HIFI_HEADPHONES)
++        return;
++
++    if (leo_hifi_set_backend(&my_data->leo) != 0)
++        ALOGE("%s: could not pin the QUAT backend to %s/%s; the route will be "
++              "reported as degraded", __func__,
++              LEO_HIFI_BITWIDTH_STR, LEO_HIFI_SAMPLERATE_STR);
++}
++
++/*
++ * Leo: exit-side backend restore, called from disable_audio_route(), which
++ * runs while usecase->out_snd_device still holds the OLD device.
++ * Deliberately tolerant -- a failure must never block stream teardown.
++ */
++void platform_leo_hifi_backend_exit(void *platform, int snd_device)
++{
++    struct platform_data *my_data = (struct platform_data *)platform;
++
++    if (my_data == NULL || snd_device != SND_DEVICE_OUT_LEO_HIFI_HEADPHONES)
++        return;
++
++    if (leo_hifi_set_backend(&my_data->leo) != 0)
++        ALOGW("%s: could not restore QUAT backend to %s/%s", __func__,
++              LEO_HIFI_BITWIDTH_STR, LEO_HIFI_SAMPLERATE_STR);
++}
++#endif
++
+ bool platform_check_and_set_codec_backend_cfg(struct audio_device* adev, struct audio_usecase *usecase)
+ {
+     ALOGV("platform_check_and_set_codec_backend_cfg usecase = %d",usecase->id );
+diff --git a/hal/msm8974/platform.h b/hal/msm8974/platform.h
+index 93c235b..efb375a 100644
+--- a/hal/msm8974/platform.h
++++ b/hal/msm8974/platform.h
+@@ -103,6 +103,17 @@ enum {
+     SND_DEVICE_OUT_ANC_HANDSET,
+     SND_DEVICE_OUT_SPEAKER_PROTECTED,
+     SND_DEVICE_OUT_VOICE_SPEAKER_PROTECTED,
++    /*
++     * Leo (Xiaomi Mi Note Pro) only: wired headphone output routed through
++     * QUAT_MI2S -> ES9018K2M -> OPA1612 instead of the WCD9330 headphone amp.
++     *
++     * MUST stay inside the OUT range and MUST be appended last so that no
++     * existing device index moves.  Never refer to this device by a numeric
++     * value: the MIUI log value 34 is SND_DEVICE_OUT_SPEAKER_PROTECTED here.
++     */
++#ifdef LEO_HIFI_ENABLED
++    SND_DEVICE_OUT_LEO_HIFI_HEADPHONES,
++#endif
+     SND_DEVICE_OUT_END,
+ 
+     /*

@@ -1,0 +1,22 @@
+leo-hifi
+Copyright 2026 The Leo Audio OS Project contributors
+
+This product contains patches to the Qualcomm audio HAL as distributed by
+MoKee (android_hardware_qcom_audio, branch mkq-mr1-caf-msm8994, commit
+7f4cac748b6f62897294cdaece9d1aec27e1e927). The patched files carry these
+upstream notices, which are retained unchanged:
+
+  Copyright (C) 2013 The Android Open Source Project
+  Copyright (c) 2013-2017, The Linux Foundation. All rights reserved.
+  Licensed under the Apache License, Version 2.0
+
+audio_hw.c also states that portions modified by DTS, Inc. are copyrighted
+separately: (C) 2014 DTS, Inc., likewise licensed under the Apache License,
+Version 2.0. That notice is retained unchanged.
+
+Files changed by this project are marked in the patch headers and in comments
+beginning with "Leo" / "Candidate B" / "Candidate C".
+
+Much of the code and documentation in this repository was produced with AI
+coding assistants (OpenAI Codex, Anthropic Claude) and reviewed and tested on
+hardware by the repository author.

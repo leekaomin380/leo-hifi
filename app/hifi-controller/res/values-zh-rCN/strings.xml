@@ -1,0 +1,23 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="leo_hifi_no_readback">尚未取得有效 HAL 音量回读</string>
+    <string name="leo_monitor_channel">状态监测</string>
+    <string name="leo_active_channel">已核实的 HiFi 工作状态</string>
+    <string name="leo_monitor_title">Leo 状态监测</string>
+    <string name="leo_monitor_description">仅表示监测服务运行，不代表 HiFi 已在工作。</string>
+    <string name="leo_active_description">路由与播放证据有效 · 停止刷新后自动消失</string>
+    <string name="leo_hifi_label">HIFI</string>
+    <string name="leo_hifi_unavailable">后端不可用</string>
+    <string name="leo_hifi_waiting">等待确认</string>
+    <string name="leo_hifi_active">ESS 播放中 · %1$s</string>
+    <string name="leo_hifi_error">请求或路由异常</string>
+    <string name="leo_hifi_volume_title">HiFi 控制</string>
+    <string name="leo_hifi_standby">已开启 · 待机</string>
+    <string name="leo_hifi_off">已关闭</string>
+    <string name="leo_hifi_volume_warning">HiFi 工作时，音量键直接调节 DAC（每档 2 dB，上限 −9 dB），Android 音量固定为 0 dB。需在“无障碍”中开启“HiFi DAC 音量键”。离开 HiFi 前会先恢复原系统音量。</string>
+    <string name="leo_hifi_volume_readback">DAC 回读：%1$d / %2$d（尚未恢复基准值）</string>
+<string name="leo_hifi_volume_fixed">DAC 回读：%1$d / %2$d · 基准值已确认</string><string name="leo_hifi_enable">开启 HiFi</string><string name="leo_hifi_disable">关闭 HiFi</string>    <string name="leo_dac_level">DAC 音量 %1$d dB</string>
+    <string name="leo_key_service_label">HiFi DAC 音量键</string>
+    <string name="leo_key_service_description">仅在 HiFi 实际工作时，把音量键交给 ESS DAC；其他情况按键仍由系统处理。</string>
+    <string name="leo_hifi_dac_readback">DAC %1$d dB（回读 %2$d / %3$d）</string>
+</resources>

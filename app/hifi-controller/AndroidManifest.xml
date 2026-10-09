@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.leoaudio.hifi.singlevolume"
+    android:versionCode="13"
+    android:versionName="0.6.5-hard-volume">
+
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="29" />
+
+    <!-- protectionLevel=normal on this ROM; AudioFlinger::setParameters gates on it. -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <application
+        android:label="@string/leo_hifi_label"
+        android:icon="@drawable/ic_leo_hifi"
+        android:directBootAware="true"
+        android:allowBackup="false">
+
+        <service android:name=".LeoHifiMonitorService" android:exported="false" />
+        <service
+            android:name=".LeoHifiKeyService"
+            android:exported="false"
+            android:label="@string/leo_key_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice"
+                android:resource="@xml/leo_key_service" />
+        </service>
+        <receiver android:name=".LeoHifiBootReceiver" android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".LeoHifiTileService"
+            android:exported="true"
+            android:icon="@drawable/ic_leo_hifi"
+            android:label="@string/leo_hifi_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <activity
+            android:name=".LeoHifiVolumeActivity"
+            android:exported="true"
+            android:label="@string/leo_hifi_volume_title"
+            android:excludeFromRecents="true"
+            android:theme="@android:style/Theme.DeviceDefault.Dialog.NoActionBar">
+            <!-- Long press on the tile lands here. -->
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <!-- Launcher entry, so the same surface can be opened directly during verification. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

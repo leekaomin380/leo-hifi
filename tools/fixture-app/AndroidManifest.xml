@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.leoaudio.fixture" android:versionCode="1" android:versionName="0.1-test-only">
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="29" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+    <application android:label="HiFi 验收音源" android:allowBackup="false">
+        <service android:name=".FixtureService" android:exported="true" android:permission="android.permission.DUMP" />
+    </application>
+</manifest>

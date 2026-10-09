@@ -1,0 +1,261 @@
+diff --git a/hal/audio_hw.c b/hal/audio_hw.c
+index 0fbdea8..04409a7 100644
+--- a/hal/audio_hw.c
++++ b/hal/audio_hw.c
+@@ -1182,6 +1182,11 @@ int select_devices(struct audio_device *adev, audio_usecase_t uc_id)
+         if (usecase->devices & AUDIO_DEVICE_OUT_ALL_CODEC_BACKEND)
+             check_and_route_playback_usecases(adev, usecase, out_snd_device);
+ #ifdef LEO_HIFI_ENABLED
++        if (platform_leo_hifi_blocks_device(adev->platform, out_snd_device)) {
++            ALOGW("%s: hard volume armed; refusing standard headphones (silent)", __func__);
++            usecase->out_snd_device = SND_DEVICE_NONE;
++            return -EPERM;
++        }
+         platform_leo_hifi_set_entry_rate(adev->platform,
+                 (usecase->type == PCM_PLAYBACK && usecase->stream.out) ?
+                 usecase->stream.out->config.rate : 0);
+diff --git a/hal/msm8974/leo_hifi.c b/hal/msm8974/leo_hifi.c
+index 8201c36..a03de70 100644
+--- a/hal/msm8974/leo_hifi.c
++++ b/hal/msm8974/leo_hifi.c
+@@ -197,6 +197,7 @@ void leo_hifi_init(struct leo_hifi *lh, struct mixer *mixer,
+      * at the mixer_paths.xml value of 205.  None of 213/225/229 may become a
+      * product default before then.  See docs/19 section 6.2.
+      */
++    lh->vol_user = LEO_HIFI_VOL_DEFAULT;
+     if (property_get(LEO_PROP_VOLUME, value, "") > 0 && value[0] != '\0') {
+         int v = atoi(value);
+ 
+@@ -206,6 +207,7 @@ void leo_hifi_init(struct leo_hifi *lh, struct mixer *mixer,
+             v = LEO_HIFI_VOL_MAX;
+         lh->vol_user = v;
+     }
++    lh->hardvol = property_get(LEO_PROP_HARDVOL, value, "") > 0 && strcmp(value, "1") == 0;
+     lh->vol_applied = false;
+ 
+     /* A service restart does not itself prove that mixer state was reset.
+@@ -850,6 +852,17 @@ void leo_hifi_on_route(struct leo_hifi *lh, bool to_hifi_device)
+         return;
+     }
+ 
++    /* Candidate C: the route is verified and no frames have been written yet,
++     * so the saved level (capped at -9 dB) is applied in one step. */
++    if (vol[0] != leo_hifi_user_to_ctl(lh->vol_user)) {
++        if (leo_write_volume_ctl(lh, leo_hifi_user_to_ctl(lh->vol_user)) != 0) {
++            (void) leo_hifi_restore_volume_floor(lh);
++            lh->fail_code = LEO_FAIL_READBACK_SOFT;
++            leo_hifi_fallback(lh);
++            return;
++        }
++    }
++    lh->vol_applied = true;
+     lh->effective = LEO_HIFI_ACTIVE;
+     ALOGI("%s: gen=%llu evidence=0x%x bypass=0x%x -> hifi_active",
+           __func__, lh->generation, lh->evidence, lh->bypass);
+@@ -944,7 +957,7 @@ int leo_hifi_process_request(struct leo_hifi *lh, const char *mode_str, const ch
+     if (vol_str) {
+         if (vol_str[0] == '0' && vol_str[1] != '\0') return -EINVAL;
+         unsigned long long v;
+-        if (!parse_uint63(vol_str, &v) || v > 60) return -EINVAL;
++        if (!parse_uint63(vol_str, &v) || v > LEO_HIFI_VOL_MAX) return -EINVAL;
+         vol_val = (int)v;
+     }
+     
+@@ -961,11 +974,20 @@ int leo_hifi_process_request(struct leo_hifi *lh, const char *mode_str, const ch
+     if (session != current_session || gen != lh->generation) return -EAGAIN;
+     
+     if (vol_str) {
++        if (!lh->supported || !lh->requested || lh->fail_code != LEO_FAIL_NONE) return -EAGAIN;
++        if (lh->effective != LEO_HIFI_ACTIVE) {
++            /* No live HiFi route: remember the level; on_route() applies it. */
++            char buf[PROPERTY_VALUE_MAX];
++            lh->vol_user = vol_val;
++            snprintf(buf, sizeof(buf), "%d", vol_val);
++            (void) property_set(LEO_PROP_VOLUME, buf);
++            return 0;
++        }
++        /* A live route whose evidence has drifted (e.g. analog bypass) must
++         * not take gain changes; only a store-only request is safe then. */
+         bool is_live, flow_active;
+-        if (!lh->requested || lh->effective != LEO_HIFI_ACTIVE || lh->fail_code != LEO_FAIL_NONE) return -EAGAIN;
+         leo_hifi_eval_state(lh, &is_live, &flow_active);
+-        if (!flow_active) return -EAGAIN;
+-        
++        if (!is_live) return -EAGAIN;
+         int ret = leo_hifi_apply_volume(lh, vol_val);
+         return (ret == 0) ? 0 : ret;
+     }
+@@ -980,6 +1002,30 @@ int leo_hifi_process_request(struct leo_hifi *lh, const char *mode_str, const ch
+     return -EINVAL;
+ }
+ 
++int leo_hifi_set_hardvol(struct leo_hifi *lh, const char *val_str, const char *sess_str)
++{
++    unsigned long long session, current;
++    bool on;
++    if (!lh || !val_str) return -EINVAL;
++    if (strcmp(val_str, "0") == 0) on = false;
++    else if (strcmp(val_str, "1") == 0) on = true;
++    else return -EINVAL;
++    if (on) {
++        /* Arming needs a live session and a supported controller. */
++        if (!sess_str || !parse_uint63(sess_str, &session) || session == 0) return -EINVAL;
++        pthread_mutex_lock(&lh->telemetry_lock);
++        current = lh->session;
++        pthread_mutex_unlock(&lh->telemetry_lock);
++        if (session != current || !lh->supported) return -EAGAIN;
++    }
++    /* Disarming is always allowed: it can only make the standard path audible
++     * again, and the app restores Android volume before it disarms. */
++    lh->hardvol = on;
++    (void) property_set(LEO_PROP_HARDVOL, on ? "1" : "0");
++    ALOGI("%s: hardvol=%d", __func__, on ? 1 : 0);
++    return 0;
++}
++
+ int leo_hifi_status_string(struct leo_hifi *lh, char *buf, size_t len)
+ {
+     const char *sign = "";
+@@ -1019,11 +1065,11 @@ int leo_hifi_status_string(struct leo_hifi *lh, char *buf, size_t len)
+ 
+     if (!buf || len == 0) return -EINVAL;
+     int n = snprintf(buf, len,
+-             "schema:4,session:%llu,gen:%llu,supported:%d,requested:%s,"
++             "schema:5,session:%llu,gen:%llu,supported:%d,requested:%s,"
+              "effective:%s,live:%d,flow:%d,vol_ctl_l:%d,vol_ctl_r:%d,"
+              "vol_db:%s%d.%d,vol_user:%d,backend:%s,fail:%d,"
+              "permanent_fail:%d,probes:%d,ev:0x%x,bypass:0x%x,vol_applied:%d,"
+-             "restore_pending:%d,acdb:absent_expected",
++             "restore_pending:%d,acdb:absent_expected,hardvol:%d",
+              current_session, lh->generation, lh->supported ? 1 : 0,
+              lh->requested ? "hifi" : "standard",
+              leo_state_name(lh->effective),
+@@ -1032,7 +1078,7 @@ int leo_hifi_status_string(struct leo_hifi *lh, char *buf, size_t len)
+              backend_str, lh->fail_code,
+              lh->permanent_fail ? 1 : 0, lh->probe_attempts,
+              lh->evidence, lh->bypass, lh->vol_applied ? 1 : 0,
+-             lh->vol_restore_pending ? 1 : 0);
++             lh->vol_restore_pending ? 1 : 0, lh->hardvol ? 1 : 0);
+     if (n < 0 || (size_t)n >= len) {
+         buf[0] = '\0'; /* Never publish a truncated, partially valid status. */
+         return -ENOSPC;
+diff --git a/hal/msm8974/leo_hifi.h b/hal/msm8974/leo_hifi.h
+index 98f4274..01daf0b 100644
+--- a/hal/msm8974/leo_hifi.h
++++ b/hal/msm8974/leo_hifi.h
+@@ -41,11 +41,15 @@
+ #define LEO_HIFI_HW_INTERFACE       "QUAT_MI2S_RX"
+ 
+ #define LEO_PROP_ENABLE             "vendor.leo.audio.hifi.enable"
+-#define LEO_PROP_VOLUME             "vendor.leo.audio.hifi.volume"
++/* Candidate C: the DAC level and the hard-volume guard must survive a reboot,
++ * otherwise the first song after boot could play at a stale, louder level. */
++#define LEO_PROP_VOLUME             "persist.vendor.leo.audio.hifi.dac"
++#define LEO_PROP_HARDVOL            "persist.vendor.leo.audio.hifi.hardvol"
+ #define LEO_PROP_SUPPORTED          "vendor.leo.audio.hifi.supported"
+ 
+ #define LEO_PARAM_KEY_MODE          "leo_hifi_mode"
+ #define LEO_PARAM_KEY_VOLUME        "leo_hifi_volume"
++#define LEO_PARAM_KEY_HARDVOL       "leo_hifi_hardvol"
+ #define LEO_PARAM_KEY_STATUS        "leo_hifi_status"
+ 
+ /*
+@@ -56,12 +60,14 @@
+  *   TLV = DB_SCALE(min = -127.50 dB, step = 0.50 dB)
+  *   => dB = -127.50 + 0.50 * ctl_value, higher control value == louder
+  *
+- * 205 is the mixer_paths.xml default (-25.0 dB) and is our absolute floor.
++ * Candidate C: the DAC is the user's volume control.  The floor is now the
++ * QUIETEST allowed value and every recovery path restores it (fail quiet).
++ * 205 (-25.0 dB, the mixer_paths.xml default) remains the default level.
+  */
+-#define LEO_HIFI_CTL_FLOOR          205     /* -25.0 dB, mixer_paths.xml default */
+-#define LEO_HIFI_CTL_BASE           213     /* user 0   -> -21.0 dB              */
+-#define LEO_HIFI_CTL_CEIL           237     /* user 60  ->  -9.0 dB, stage-1 cap */
+-#define LEO_HIFI_VOL_MAX            60      /* user scale cap before R6/R7       */
++#define LEO_HIFI_CTL_FLOOR          135     /* user 0   -> -60.0 dB, fail-quiet  */
++#define LEO_HIFI_CTL_CEIL           237     /* user 51  ->  -9.0 dB, stage-1 cap */
++#define LEO_HIFI_VOL_MAX            51      /* 1 dB per user unit                */
++#define LEO_HIFI_VOL_DEFAULT        35      /* -25.0 dB = previous fixed level   */
+ #define LEO_HIFI_VOL_STEP_MAX       5       /* max user units applied per frame  */
+ 
+ /* Number of MultiMedia front ends to scan on both backends. */
+@@ -145,7 +151,8 @@ struct leo_hifi {
+ 
+     int                 vol_user;       /* 0..LEO_HIFI_VOL_MAX                   */
+     bool                vol_applied;    /* false until we have written "Volume"  */
+-    bool                vol_restore_pending; /* only clear after verified 205/205 */
++    bool                vol_restore_pending; /* only clear after verified floor */
++    bool                hardvol;        /* app pinned Android media gain at 0 dB */
+ 
+     const char         *device_name;    /* device_table entry, for the self-check */
+     struct mixer       *mixer;
+@@ -191,10 +198,10 @@ bool leo_hifi_set_mode(struct leo_hifi *lh, bool enable);
+  * Independent HiFi volume (ES9018 "Volume" kcontrol)
+  * ---------------------------------------------------------------------- */
+ 
+-/* ctl = LEO_HIFI_CTL_BASE + (user * 2) / 5   =>   dB = -21.0 + 0.2 * user */
++/* ctl = LEO_HIFI_CTL_FLOOR + 2 * user   =>   dB = -60.0 + 1.0 * user */
+ static inline int leo_hifi_user_to_ctl(int user)
+ {
+-    return LEO_HIFI_CTL_BASE + (user * 2) / 5;
++    return LEO_HIFI_CTL_FLOOR + 2 * user;
+ }
+ 
+ /*
+@@ -259,6 +266,12 @@ int leo_hifi_set_backend(struct leo_hifi *lh);
+ 
+ /* Rate of the playback stream about to enable a QUAT device (0 = default). */
+ void leo_hifi_set_entry_rate(struct leo_hifi *lh, unsigned int rate);
++
++/* Hard volume: while set, the standard (non-HiFi) headphone path is refused,
++ * so a route that leaves HiFi with Android gain pinned at 0 dB is silent
++ * rather than loud.  Clearing is always accepted; setting needs the session. */
++int leo_hifi_set_hardvol(struct leo_hifi *lh, const char *val_str, const char *sess_str);
++bool platform_leo_hifi_blocks_device(void *platform, int snd_device);
+ void platform_leo_hifi_set_entry_rate(void *platform, unsigned int rate);
+ 
+ /*
+diff --git a/hal/msm8974/platform.c b/hal/msm8974/platform.c
+index d1dc0f8..147a7cb 100644
+--- a/hal/msm8974/platform.c
++++ b/hal/msm8974/platform.c
+@@ -2915,6 +2915,25 @@ int platform_set_parameters(void *platform, struct str_parms *parms)
+         int has_gen = str_parms_get_str(parms, "leo_hifi_gen", value, len) >= 0;
+         if (has_gen) gen_val = strdup(value);
+ 
++        char *hv_val = NULL;
++        int has_hv = str_parms_get_str(parms, LEO_PARAM_KEY_HARDVOL, value, len) >= 0;
++        if (has_hv) hv_val = strdup(value);
++        if (has_hv) {
++            int hv_ret;
++            str_parms_del(parms, LEO_PARAM_KEY_HARDVOL);
++            if (has_sess) str_parms_del(parms, "leo_hifi_session");
++            if (has_gen) str_parms_del(parms, "leo_hifi_gen");
++            hv_ret = (!hv_val || has_mode || has_vol) ? -EINVAL
++                    : leo_hifi_set_hardvol(&my_data->leo, hv_val, sess_val);
++            free(hv_val); free(mode_val); free(vol_val); free(sess_val); free(gen_val);
++            if (hv_ret != 0) {
++                ret = hv_ret;
++                goto done;
++            }
++            mode_val = vol_val = sess_val = gen_val = NULL;
++            has_mode = has_vol = has_sess = has_gen = 0;
++        }
++
+         if (has_mode || has_vol || has_sess || has_gen) {
+             if (has_mode) str_parms_del(parms, LEO_PARAM_KEY_MODE);
+             if (has_vol) str_parms_del(parms, LEO_PARAM_KEY_VOLUME);
+@@ -3673,6 +3692,12 @@ int platform_leo_hifi_snd_device_enabled(void *platform, int snd_device)
+             platform_leo_hifi_devices_busy(my_data, snd_device));
+ }
+ 
++bool platform_leo_hifi_blocks_device(void *platform, int snd_device)
++{
++    struct platform_data *my_data = (struct platform_data *)platform;
++    return my_data && my_data->leo.hardvol && snd_device == SND_DEVICE_OUT_HEADPHONES;
++}
++
+ void platform_leo_hifi_set_entry_rate(void *platform, unsigned int rate)
+ {
+     struct platform_data *my_data = (struct platform_data *)platform;
