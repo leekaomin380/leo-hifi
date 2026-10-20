@@ -3,12 +3,11 @@ package com.leoaudio.hifi.singlevolume;
 import android.accessibilityservice.AccessibilityService;
 import android.view.KeyEvent;
 import android.view.accessibility.AccessibilityEvent;
-import android.widget.Toast;
 
 /** Routes the hardware volume keys to the ESS DAC while hard volume is pinned.
  * Any other time the keys are returned to Android untouched. */
 public final class LeoHifiKeyService extends AccessibilityService {
-    private Toast toast;
+    private LeoVolumeOverlay overlay;
     private boolean consumingDown;
 
     @Override protected void onServiceConnected() {
@@ -18,6 +17,7 @@ public final class LeoHifiKeyService extends AccessibilityService {
 
     @Override public boolean onUnbind(android.content.Intent intent) {
         LeoHardVolume.keyServiceConnected = false;
+        if (overlay != null) overlay.hide();
         // Only a user who switched the service off ends hard volume; an app
         // update or process restart re-binds and must keep the pinned level.
         if (!LeoHardVolume.get(this).keyServiceEnabled())
@@ -36,9 +36,8 @@ public final class LeoHifiKeyService extends AccessibilityService {
         int level = LeoHardVolume.get(this).onVolumeKey(code == KeyEvent.KEYCODE_VOLUME_UP);
         consumingDown = level >= 0;
         if (level < 0) return false;
-        if (toast != null) toast.cancel();
-        toast = Toast.makeText(this, getString(R.string.leo_dac_level, level - 60), Toast.LENGTH_SHORT);
-        toast.show();
+        if (overlay == null) overlay = new LeoVolumeOverlay(this);
+        overlay.show(level);
         return true;
     }
 

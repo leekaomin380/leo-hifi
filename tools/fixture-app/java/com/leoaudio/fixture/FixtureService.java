@@ -39,7 +39,7 @@ public final class FixtureService extends Service {
             else {
                 close(slot);
                 try {
-                    Source source = new Source(slot, rate);
+                    Source source = new Source(slot, rate, "lfsr".equals(intent.getStringExtra("pattern")));
                     sources[slot] = source;
                     source.start();
                     handler.postDelayed(() -> { if (sources[slot] == source) close(slot); }, duration * 1000L);
@@ -70,7 +70,7 @@ public final class FixtureService extends Service {
         handler.removeCallbacksAndMessages(null); close(0); close(1); super.onDestroy();
     }
     @Override protected void dump(FileDescriptor fd, PrintWriter out, String[] args) {
-        out.println("test-only; amplitude=0.008 (-41.94 dBFS); no focus/volume changes");
+        out.println("test-only; sine amplitude=0.008 (-41.94 dBFS) or lfsr pattern (peak -36 dBFS); no focus/volume changes");
         out.println("last_error=" + lastError);
         try { out.println("hal_status=" + getSystemService(AudioManager.class).getParameters("leo_hifi_status")); }
         catch (RuntimeException e) { out.println("hal_status_error=" + e.toString()); }
@@ -88,7 +88,7 @@ public final class FixtureService extends Service {
         volatile long writtenFrames;
         volatile int writeError;
         Thread writer;
-        Source(int slot, int rate) {
+        Source(int slot, int rate, boolean lfsr) {
             this.slot = slot; this.rate = rate;
             int minimum = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT);
             if (minimum <= 0) throw new IllegalStateException("min buffer " + minimum);
@@ -103,10 +103,24 @@ public final class FixtureService extends Service {
             if (track.getState() != AudioTrack.STATE_INITIALIZED) { track.release(); throw new IllegalStateException("track uninitialized"); }
             // One second repeats at an integral frequency, avoiding discontinuity at the loop boundary.
             samples = new short[rate * 2];
-            int frequency = slot == 0 ? 440 : 660;
-            for (int frame = 0; frame < rate; frame++) {
-                short value = (short)Math.round(32767 * 0.008 * Math.sin(2 * Math.PI * frequency * frame / rate));
-                samples[frame * 2] = value; samples[frame * 2 + 1] = value;
+            if (lfsr) {
+                // Bit-exactness pattern: integer-only, so the expected samples can be
+                // regenerated anywhere. 16-bit Galois LFSR (taps 0xB400, seed 0xACE1);
+                // L = low 10 bits - 512 (peak about -36 dBFS), R = ~L (detects swaps).
+                int state = 0xACE1;
+                for (int frame = 0; frame < rate; frame++) {
+                    int lsb = state & 1;
+                    state >>>= 1;
+                    if (lsb != 0) state ^= 0xB400;
+                    short value = (short)((state & 0x3FF) - 512);
+                    samples[frame * 2] = value; samples[frame * 2 + 1] = (short)~value;
+                }
+            } else {
+                int frequency = slot == 0 ? 440 : 660;
+                for (int frame = 0; frame < rate; frame++) {
+                    short value = (short)Math.round(32767 * 0.008 * Math.sin(2 * Math.PI * frequency * frame / rate));
+                    samples[frame * 2] = value; samples[frame * 2 + 1] = value;
+                }
             }
         }
         void start() {
