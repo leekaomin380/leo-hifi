@@ -11,7 +11,14 @@ cd hardware/qcom-caf/msm8994/audio
 for p in /path/to/leo-hifi/hal/patches/0*.patch; do git apply "$p"; done
 ```
 
-四个补丁必须按编号顺序应用。按顺序打完后，得到的就是开发者设备上运行的候选 C 源码；这一点已逐字节核对过。只打到 02 是候选 A（固定 48 kHz），打到 03 是候选 B。
+补丁必须按编号顺序应用。打到 02 是候选 A（固定 48 kHz），打到 03 是候选 B，打到 04 是候选 C。**打完 05 就是开发者设备当前运行的候选 D**（2026-10-20 部署）：把 05 打在候选 C 的源码树上，得到的结果已逐字节核对过。
+
+05 号补丁（候选 D）包含：
+
+- **滤波器**：进入 HiFi 时，把 ES9018 的数字滤波器写成 `persist.vendor.leo.audio.hifi.filter` 指定的形状（默认 Fast Rolloff；设为 `keep` 则不写）。驱动重新初始化时会把滤波器重置为 Minimum Phase，这一步就是为了把它改回来。写入失败只记日志，不影响 HiFi 状态。
+- **缓冲周期**：`persist.vendor.leo.audio.deep_period` 用来设置 deep-buffer 的周期帧数，必须在 960～3840 之间并且是 960 的倍数；不设置时和原来一样。在这台设备上实测，2880 帧可用，3840 帧会被 ADSP 拒绝（`hw params` 返回 EINVAL，结果是静音）。
+- **SIGPIPE**：HAL 服务进程里的 effects HAL 会向 dumpsys 的管道写数据，管道被提前截断时进程会被 SIGPIPE 杀掉。补丁让 HAL 在 SIGPIPE 仍是默认处理方式时改为忽略。
+- **调试抓取**：设置 `vendor.leo.audio.capture_bytes=<N>` 并重启音频服务后，HAL 会把 deep-buffer 流交给 `pcm_write` 的前 N 字节复制到 `/data/vendor/audio/leo-capture.raw`。这个目录需要预先建好，属主为 audioserver。用它配合测试音源的 `lfsr` 模式和 `tools/device/verify_bitexact.py`，就能做逐位比对。
 
 ## 编译
 
@@ -37,8 +44,9 @@ m AUDIO_FEATURE_ENABLED_LEO_HIFI=true audio.primary.msm8994
 
 ```sh
 cd hal/host-tests
-sh run-candidate-c.sh /path/to/patched/audio   # 包含 run.sh、run-lifecycle.sh、run-candidate-b.sh 的全部场景
+sh run-candidate-c.sh /path/to/patched/audio   # 包含 run.sh、run-lifecycle.sh、run-candidate-b.sh 的全部场景（251 项）
 CC="clang -fsanitize=address,undefined -g" sh run-candidate-c.sh /path/to/patched/audio
+sh run-candidate-d.sh /path/to/patched/audio   # 打到 05 时用：前面全部场景，加 16 项滤波器场景（267 项）
 ```
 
 这些测试只能证明逻辑正确，**不能**代替 Android 编译或实机验证。

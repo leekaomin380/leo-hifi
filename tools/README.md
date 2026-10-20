@@ -83,3 +83,36 @@ adb shell dumpsys activity service com.leoaudio.fixture/.FixtureService   # 帧�
 ```
 
 `raw-hifi-off` 命令会绕过 HiFi 应用，直接让 HAL 关闭 HiFi，用来验证意外退出时声音是否保持静音。**仅限测试使用。**
+
+## device/boot-tuning/：开机调优服务（2026-10-20）
+
+`leo-tuning.rc` 放在 `/system/etc/init/`，`leo-tuning.sh` 放在 `/system/etc/`；开机完成（`sys.boot_completed=1`）后由 init 以 root 身份启动。脚本每 60 秒检查一次：
+
+- 把两个 CPU 簇的 `scaling_max_freq` 压到 1.248 GHz。**只会往下压**：如果温控已经设了更低的值，脚本不去动它。
+- A57 簇全部下线、而 core_ctl 又要求至少一个在线时，把 cpu4 拉回来（电池温度 ≥ 40 °C 时不做）。
+- 确保 ES9018 滤波器是 Fast Rolloff。05 号补丁之后，这一项和 HAL 的功能重复，保留下来作为兜底。
+
+写入这两个文件需要把 system 分区临时改成可读写，写完要恢复为只读。删除这两个文件，再重启，即可停用。日志写在 `/data/local/tmp/leo-tuning.log`。
+
+## device/fg_sample.sh：拔线功耗采样（在手机上运行）
+
+```sh
+adb push fg_sample.sh /data/local/tmp/leo-power/
+adb shell 'nohup sh /data/local/tmp/leo-power/fg_sample.sh 900 > /dev/null 2>&1 &'   # 约 20 分钟
+```
+
+脚本每秒记录一次：`current_now`（单位 μA，**放电为正**）、电压、USB 是否接入、背光、cpu0 频率、在线核、电池温度。拔线后，按 USB 和背光两列就能分出各个阶段，所以操作时不用掐时间。这台设备的电量计大约每 4.4 秒刷新一次，也没有 `charge_counter` 节点，功耗只能对电流积分来算。
+
+## device/watch-route.sh：路由安全监视（在手机上运行）
+
+每 0.5 秒左右采样一次：QUAT 路由、高通耳机 DAC 开关、媒体音量档位、硬音量保护、PCM 状态。如果出现"普通耳机 DAC 打开，同时媒体音量为最大"，就标记为 `UNSAFE`。适合在杀进程、开关无障碍服务、拔插耳机、升级 App 时一起运行。
+
+## device/verify_bitexact.py：逐位比对
+
+```sh
+adb shell am start-foreground-service -n com.leoaudio.fixture/.FixtureService \
+    --es command music --ei rate 44100 --ei seconds 15 --es pattern lfsr
+python3 verify_bitexact.py leo-capture.raw 44100
+```
+
+测试音源的 `lfsr` 模式只用整数运算生成伪随机序列：16 位 Galois LFSR，L 取低 10 位减 512（峰值约 −36 dBFS），R = ~L。比对脚本重新生成同样的序列，在抓取数据里找到对齐位置，然后逐帧比较；也会报告左右声道是否被交换。开发者设备上的实测结果：去掉开头一个周期的静音之后，440,040 帧全部逐位一致。

@@ -20,4 +20,6 @@
     <string name="leo_key_service_label">HiFi DAC 音量键</string>
     <string name="leo_key_service_description">仅在 HiFi 实际工作时，把音量键交给 ESS DAC；其他情况按键仍由系统处理。</string>
     <string name="leo_hifi_dac_readback">DAC %1$d dB（回读 %2$d / %3$d）</string>
+    <string name="leo_dac_at_max">" · 已到上限"</string>
+    <string name="leo_dac_at_min">" · 已到下限"</string>
 </resources>

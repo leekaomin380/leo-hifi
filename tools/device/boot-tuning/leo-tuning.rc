@@ -1,0 +1,10 @@
+# Leo HiFi boot tuning; script: /system/etc/leo-tuning.sh. Delete this file to disable.
+service leo-tuning /system/bin/sh /system/etc/leo-tuning.sh
+    user root
+    group root audio
+    seclabel u:r:su:s0
+    disabled
+    oneshot
+
+on property:sys.boot_completed=1
+    start leo-tuning

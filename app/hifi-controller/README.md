@@ -1,4 +1,4 @@
-# Leo HiFi 控制应用（0.6.5-hard-volume）
+# Leo HiFi 控制应用（0.7.0-volume-overlay）
 
 包名：`com.leoaudio.hifi.singlevolume`，目标 Android 10（API 29）。它是普通应用：不需要 platform 签名，也不需要特权权限。需要配合打了候选 C 补丁的 HAL 使用（状态协议 schema 5）；在 schema 4 的 HAL 上只显示状态，不提供 DAC 音量。
 
@@ -8,6 +8,7 @@
 - 已核实的工作状态：路由与播放证据都有效时，通知栏显示"ESS 播放中 · 44.1 kHz / 48 kHz"。证据超过 3 秒没有刷新，通知会自动消失。
 - 熄屏时停止每秒一次的状态轮询，亮屏后立即读取一次。
 - **DAC 硬音量**：通过无障碍服务"HiFi DAC 音量键"实现。只在 HiFi 实际工作时接管音量键，每按一次调 2 dB；其他情况下按键交还给系统。
+- **音量提示**（0.7.0 起）：每按一次音量键，屏幕上方会以无障碍浮层显示"DAC 音量 X dB"和进度条，到达上下限时会标明，1.5 秒后自动消失。0.6 用的是 Toast，但如果这个应用的通知被关掉，Android 10 会连带屏蔽它的 Toast（日志里能看到 `Suppressing toast ... by user request`）；浮层不受通知设置影响，也不需要额外权限。
 
 ## 硬音量的安全顺序
 

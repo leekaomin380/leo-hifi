@@ -4,7 +4,7 @@
 set -e
 HERE=$(cd "$(dirname "$0")" && pwd)
 SDK=${ANDROID_SDK:-$HOME/Library/Android/sdk}
-BT=$SDK/build-tools/36.0.0
+BT=${ANDROID_BUILD_TOOLS:-$SDK/build-tools/36.0.0}
 JAR=${ANDROID_API_JAR:-$SDK/platforms/android-29/android.jar}
 [ -f "$JAR" ] || { echo "API 29 android.jar required (ANDROID_API_JAR may specify its path)" >&2; exit 1; }
 JDK=${JAVA_HOME:-/opt/homebrew/opt/openjdk}
